@@ -41,21 +41,28 @@ def add_histogram_column():
     conn.commit()
     conn.close()
 
-# Get all unique movie URLs from the database
-def get_unique_movie_urls():
+# Get all unique movie URLs from the database with their associated row IDs
+def get_movie_urls_with_ids():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    cursor.execute("SELECT DISTINCT movie_url FROM reviews WHERE user_review_histogram IS NULL")
-    urls = [row[0] for row in cursor.fetchall()]
+    # Get distinct movie URLs with the minimum row ID for each URL
+    cursor.execute("""
+        SELECT movie_url, MIN(id) as first_id
+        FROM reviews 
+        WHERE user_review_histogram IS NULL
+        GROUP BY movie_url
+    """)
     
+    url_data = [(row[0], row[1]) for row in cursor.fetchall()]
     conn.close()
-    return urls
+    return url_data
 
-# Save checkpoint with the last processed URL
-def save_checkpoint(url, processed_count, total_count):
+# Save checkpoint with the last processed database ID
+def save_checkpoint(row_id, url, processed_count, total_count):
     checkpoint_data = {
-        "last_processed_url": url,
+        "last_processed_id": row_id,
+        "last_processed_url": url,  # Just for logging/display purposes
         "processed_count": processed_count,
         "total_count": total_count,
         "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -64,7 +71,7 @@ def save_checkpoint(url, processed_count, total_count):
     with open(CHECKPOINT_FILE, 'w') as f:
         json.dump(checkpoint_data, f, indent=2)
     
-    print(f"Checkpoint saved: {processed_count}/{total_count} URLs processed")
+    print(f"Checkpoint saved: {processed_count}/{total_count} URLs processed (Last ID: {row_id})")
 
 # Load checkpoint to resume scraping
 def load_checkpoint():
@@ -75,7 +82,7 @@ def load_checkpoint():
         checkpoint_data = json.load(f)
     
     print(f"Checkpoint found from {checkpoint_data['timestamp']}")
-    print(f"Resuming after URL: {checkpoint_data['last_processed_url']}")
+    print(f"Resuming after database ID: {checkpoint_data['last_processed_id']}")
     print(f"Previously processed: {checkpoint_data['processed_count']}/{checkpoint_data['total_count']} URLs")
     
     return checkpoint_data
@@ -151,7 +158,7 @@ def extract_histogram_data(page):
         return None
 
 # Process all URLs in a single browser session
-def process_urls(urls, start_index=0):
+def process_urls(url_data, start_index=0):
     global shutting_down
     
     with sync_playwright() as p:
@@ -164,19 +171,21 @@ def process_urls(urls, start_index=0):
         
         # Process URLs sequentially
         completed = start_index
-        total = len(urls)
+        total = len(url_data)
         
-        for i in range(start_index, len(urls)):
-            url = urls[i]
+        for i in range(start_index, len(url_data)):
+            url, row_id = url_data[i]
             
             # Check if we should shut down
             if shutting_down:
                 print("Graceful shutdown activated. Saving checkpoint and exiting...")
-                save_checkpoint(urls[i-1] if i > 0 else "", completed, total)
+                prev_id = url_data[i-1][1] if i > 0 else 0
+                prev_url = url_data[i-1][0] if i > 0 else ""
+                save_checkpoint(prev_id, prev_url, completed, total)
                 break
                 
             try:
-                print(f"Processing: {url}")
+                print(f"Processing: {url} (ID: {row_id})")
                 
                 # Create a new page
                 page = context.new_page()
@@ -206,12 +215,12 @@ def process_urls(urls, start_index=0):
                 else:
                     print(f"No histogram data found for {url}")
                 
-                # Update completed count and save checkpoint
+                # Update completed count
                 completed += 1
                 
                 # Save checkpoint every 5 URLs
                 if completed % 5 == 0:
-                    save_checkpoint(url, completed, total)
+                    save_checkpoint(row_id, url, completed, total)
                 
                 # Small delay to avoid rate limiting
                 time.sleep(1)
@@ -228,8 +237,10 @@ def process_urls(urls, start_index=0):
             print(f"Progress: {completed}/{total} URLs processed ({(completed/total)*100:.1f}%)")
         
         # Final checkpoint save
-        if not shutting_down and completed > start_index:
-            save_checkpoint(urls[completed-1], completed, total)
+        if not shutting_down and completed > start_index and completed < total:
+            last_id = url_data[completed-1][1]
+            last_url = url_data[completed-1][0]
+            save_checkpoint(last_id, last_url, completed, total)
         
         # Close the browser
         print("Closing browser...")
@@ -237,6 +248,13 @@ def process_urls(urls, start_index=0):
         browser.close()
         
         return completed
+
+def find_start_index(url_data, last_id):
+    """Find the index to start from based on the last processed ID"""
+    for i, (url, row_id) in enumerate(url_data):
+        if row_id == last_id:
+            return i + 1  # Start with the next one
+    return 0  # If not found, start from the beginning
 
 def main():
     current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -252,12 +270,12 @@ def main():
     # Add the histogram column to the database
     add_histogram_column()
     
-    # Get unique movie URLs
-    all_urls = get_unique_movie_urls()
-    print(f"Found {len(all_urls)} unique movie URLs to process")
+    # Get unique movie URLs with their IDs
+    url_data = get_movie_urls_with_ids()
+    print(f"Found {len(url_data)} unique movie URLs to process")
     
     # Check if there are any URLs to process
-    if not all_urls:
+    if not url_data:
         print("No URLs to process. All histograms may have been collected already.")
         return
     
@@ -266,15 +284,14 @@ def main():
     start_index = 0
     
     if checkpoint:
-        # Find the index of the last processed URL
-        last_url = checkpoint["last_processed_url"]
-        if last_url in all_urls:
-            start_index = all_urls.index(last_url) + 1
+        # Find the index of the last processed URL by ID
+        last_id = checkpoint["last_processed_id"]
+        start_index = find_start_index(url_data, last_id)
         
         print(f"Resuming from URL index {start_index}")
         
         # Check if we've already completed all URLs
-        if start_index >= len(all_urls):
+        if start_index >= len(url_data):
             print("All URLs have been processed according to checkpoint.")
             # Clean up checkpoint file
             os.remove(CHECKPOINT_FILE)
@@ -282,17 +299,17 @@ def main():
     
     # Process the URLs
     start_time = time.time()
-    total_processed = process_urls(all_urls, start_index)
+    total_processed = process_urls(url_data, start_index)
     
     # If we've processed all URLs successfully, remove the checkpoint file
-    if total_processed == len(all_urls) and not shutting_down:
+    if total_processed == len(url_data) and not shutting_down:
         if os.path.exists(CHECKPOINT_FILE):
             os.remove(CHECKPOINT_FILE)
             print("Checkpoint file removed as all URLs were processed successfully.")
     
     duration = time.time() - start_time
     print(f"Histogram scraping completed in {duration:.2f} seconds")
-    if total_processed > 0:
+    if total_processed > start_index:
         print(f"Average time per URL: {duration/(total_processed-start_index):.2f} seconds")
 
 if __name__ == "__main__":
