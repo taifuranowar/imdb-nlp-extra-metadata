@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import time
 from datetime import datetime
+from urllib.parse import urljoin
 
 from playwright.sync_api import sync_playwright
 
@@ -54,6 +55,11 @@ def add_required_columns():
         cursor.execute("ALTER TABLE reviews ADD COLUMN movie_genre TEXT")
         print("Added movie_genre column to the database")
     
+    # Add plot_keywords column if it doesn't exist
+    if "plot_keywords" not in columns:
+        cursor.execute("ALTER TABLE reviews ADD COLUMN plot_keywords TEXT")
+        print("Added plot_keywords column to the database")
+    
     conn.commit()
     conn.close()
 
@@ -73,6 +79,13 @@ def get_movie_urls_with_ids():
     url_data = [(row[0], row[1]) for row in cursor.fetchall()]
     conn.close()
     return url_data
+
+# Extract the movie ID from the URL
+def extract_movie_id(url):
+    match = re.search(r'/title/(tt\d+)/', url)
+    if match:
+        return match.group(1)
+    return None
 
 # Save checkpoint with the last processed database ID
 def save_checkpoint(row_id, url, processed_count, total_count):
@@ -103,7 +116,7 @@ def load_checkpoint():
     
     return checkpoint_data
 
-# Update the database with the histogram data, separate rating fields, and movie genres
+# Update the database with all movie data
 def update_movie_data(movie_url, movie_data):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -113,11 +126,11 @@ def update_movie_data(movie_url, movie_data):
     average_rating = histogram_data.get("average_rating") 
     vote_count = histogram_data.get("vote_count")
     movie_genre = movie_data.get("movie_genre")
+    plot_keywords = movie_data.get("plot_keywords")
     
-    # Convert genres list to JSON string
+    # Convert data to JSON strings
     genres_json = json.dumps(movie_genre) if movie_genre else None
-    
-    # Convert histogram data to JSON string
+    keywords_json = json.dumps(plot_keywords) if plot_keywords else None
     histogram_json = json.dumps(histogram_data) if histogram_data else None
     
     # Update all reviews for this movie URL with all fields
@@ -127,10 +140,11 @@ def update_movie_data(movie_url, movie_data):
         SET user_review_histogram = ?, 
             movie_average_rating = ?,
             rating_vote_count = ?,
-            movie_genre = ?
+            movie_genre = ?,
+            plot_keywords = ?
         WHERE movie_url = ?
         """,
-        (histogram_json, average_rating, vote_count, genres_json, movie_url)
+        (histogram_json, average_rating, vote_count, genres_json, keywords_json, movie_url)
     )
     
     updated_rows = cursor.rowcount
@@ -138,6 +152,42 @@ def update_movie_data(movie_url, movie_data):
     conn.close()
     
     return updated_rows
+
+# Extract plot keywords from the keywords page
+def extract_plot_keywords(page, movie_url):
+    try:
+        # Extract movie ID from URL
+        movie_id = extract_movie_id(movie_url)
+        if not movie_id:
+            print(f"Could not extract movie ID from URL: {movie_url}")
+            return None
+        
+        # Construct keywords URL
+        keywords_url = f"https://www.imdb.com/title/{movie_id}/keywords/"
+        
+        # Navigate to the keywords page
+        print(f"Navigating to keywords page: {keywords_url}")
+        page.goto(keywords_url, wait_until="domcontentloaded", timeout=60000)
+        
+        # Wait for keywords to load
+        try:
+            page.wait_for_selector('ul.ipc-metadata-list li[data-testid="list-summary-item"]', timeout=10000)
+        except Exception as e:
+            print(f"No keywords found for {movie_url}: {e}")
+            return None
+        
+        # Extract all keyword elements
+        keyword_elements = page.query_selector_all('li[data-testid="list-summary-item"] a.ipc-metadata-list-summary-item__t')
+        
+        # Extract the text from each keyword element
+        keywords = [keyword.text_content().strip() for keyword in keyword_elements if keyword.text_content()]
+        
+        print(f"Found {len(keywords)} keywords for {movie_url}")
+        return keywords
+        
+    except Exception as e:
+        print(f"Error extracting plot keywords: {e}")
+        return None
 
 # Extract movie genres from the page
 def extract_movie_genres(page):
@@ -211,11 +261,12 @@ def extract_histogram_data(page):
         return None
 
 # Extract all movie data from the page
-def extract_movie_data(page):
+def extract_movie_data(page, movie_url):
     # Initialize the movie data dictionary
     movie_data = {
         "histogram_data": None,
-        "movie_genre": None
+        "movie_genre": None,
+        "plot_keywords": None
     }
     
     # Extract histogram data
@@ -227,6 +278,11 @@ def extract_movie_data(page):
     movie_genre = extract_movie_genres(page)
     if movie_genre:
         movie_data["movie_genre"] = movie_genre
+    
+    # Extract plot keywords (this will navigate to a different page)
+    plot_keywords = extract_plot_keywords(page, movie_url)
+    if plot_keywords:
+        movie_data["plot_keywords"] = plot_keywords
     
     return movie_data
 
@@ -241,6 +297,9 @@ def process_urls(url_data, start_index=0):
         
         # Create a single context for the entire session
         context = browser.new_context()
+        
+        # Create a single page for reuse
+        page = context.new_page()
         
         # Process URLs sequentially
         completed = start_index
@@ -260,10 +319,7 @@ def process_urls(url_data, start_index=0):
             try:
                 print(f"Processing: {url} (ID: {row_id})")
                 
-                # Create a new page
-                page = context.new_page()
-                
-                # Navigate to the URL
+                # Navigate to the main movie URL
                 page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 
                 # Wait for either the histogram or the genres to load
@@ -271,17 +327,17 @@ def process_urls(url_data, start_index=0):
                     page.wait_for_selector('div[data-testid="rating-histogram"], div[data-testid="interests"]', timeout=10000)
                 except Exception:
                     print(f"No rating histogram or genres found for {url}")
-                    page.close()
                     continue
                 
-                # Extract all movie data
-                movie_data = extract_movie_data(page)
-                
-                # Close the page
-                page.close()
+                # Extract all movie data (including keywords from separate page)
+                movie_data = extract_movie_data(page, url)
                 
                 # Update the database if we found any data
-                if movie_data and (movie_data["histogram_data"] or movie_data["movie_genre"]):
+                has_data = (movie_data["histogram_data"] or 
+                           movie_data["movie_genre"] or 
+                           movie_data["plot_keywords"])
+                
+                if has_data:
                     # Update the database with all collected data
                     updated = update_movie_data(url, movie_data)
                     print(f"Updated {updated} reviews for URL: {url}")
@@ -292,6 +348,10 @@ def process_urls(url_data, start_index=0):
                     
                     if movie_data["movie_genre"]:
                         print(f"Movie Genres: {', '.join(movie_data['movie_genre'])}")
+                    
+                    if movie_data["plot_keywords"]:
+                        keyword_sample = movie_data["plot_keywords"][:5]  # Show first 5 keywords
+                        print(f"Plot Keywords: {', '.join(keyword_sample)}... ({len(movie_data['plot_keywords'])} total)")
                 else:
                     print(f"No data found for {url}")
                 
@@ -307,11 +367,6 @@ def process_urls(url_data, start_index=0):
                 
             except Exception as e:
                 print(f"Error processing {url}: {e}")
-                # Try to close the page if it's still open
-                try:
-                    page.close()
-                except:
-                    pass
             
             # Update progress
             print(f"Progress: {completed}/{total} URLs processed ({(completed/total)*100:.1f}%)")
@@ -324,6 +379,7 @@ def process_urls(url_data, start_index=0):
         
         # Close the browser
         print("Closing browser...")
+        page.close()
         context.close()
         browser.close()
         
