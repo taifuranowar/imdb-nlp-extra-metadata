@@ -25,18 +25,29 @@ def signal_handler(sig, frame):
 # Register the signal handler
 signal.signal(signal.SIGINT, signal_handler)
 
-# Add a column for the histogram data if it doesn't exist
-def add_histogram_column():
+# Add necessary columns to the database if they don't exist
+def add_required_columns():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Check if the column already exists
+    # Check existing columns
     cursor.execute("PRAGMA table_info(reviews)")
     columns = [info[1] for info in cursor.fetchall()]
     
+    # Add histogram column if it doesn't exist
     if "user_review_histogram" not in columns:
         cursor.execute("ALTER TABLE reviews ADD COLUMN user_review_histogram TEXT")
         print("Added user_review_histogram column to the database")
+    
+    # Add movie_average_rating column if it doesn't exist
+    if "movie_average_rating" not in columns:
+        cursor.execute("ALTER TABLE reviews ADD COLUMN movie_average_rating TEXT")
+        print("Added movie_average_rating column to the database")
+    
+    # Add rating_vote_count column if it doesn't exist
+    if "rating_vote_count" not in columns:
+        cursor.execute("ALTER TABLE reviews ADD COLUMN rating_vote_count TEXT")
+        print("Added rating_vote_count column to the database")
     
     conn.commit()
     conn.close()
@@ -87,18 +98,28 @@ def load_checkpoint():
     
     return checkpoint_data
 
-# Update the database with the histogram data
-def update_histogram_data(movie_url, histogram_data):
+# Update the database with the histogram data and separate rating fields
+def update_movie_data(movie_url, histogram_data):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    
+    # Extract average rating and vote count from histogram data
+    average_rating = histogram_data.get("average_rating") 
+    vote_count = histogram_data.get("vote_count")
     
     # Convert histogram data to JSON string
     histogram_json = json.dumps(histogram_data)
     
-    # Update all reviews for this movie URL
+    # Update all reviews for this movie URL with all three fields
     cursor.execute(
-        "UPDATE reviews SET user_review_histogram = ? WHERE movie_url = ?",
-        (histogram_json, movie_url)
+        """
+        UPDATE reviews 
+        SET user_review_histogram = ?, 
+            movie_average_rating = ?,
+            rating_vote_count = ?
+        WHERE movie_url = ?
+        """,
+        (histogram_json, average_rating, vote_count, movie_url)
     )
     
     updated_rows = cursor.rowcount
@@ -208,10 +229,10 @@ def process_urls(url_data, start_index=0):
                 page.close()
                 
                 if histogram_data:
-                    # Update the database with histogram data
-                    updated = update_histogram_data(url, histogram_data)
+                    # Update the database with histogram data and separate fields
+                    updated = update_movie_data(url, histogram_data)
                     print(f"Updated {updated} reviews for URL: {url}")
-                    print(f"Histogram data: {histogram_data}")
+                    print(f"Average Rating: {histogram_data.get('average_rating')}, Vote Count: {histogram_data.get('vote_count')}")
                 else:
                     print(f"No histogram data found for {url}")
                 
@@ -267,8 +288,8 @@ def main():
         print(f"Error: Database not found: {DB_PATH}")
         return
     
-    # Add the histogram column to the database
-    add_histogram_column()
+    # Add required columns to the database
+    add_required_columns()
     
     # Get unique movie URLs with their IDs
     url_data = get_movie_urls_with_ids()
