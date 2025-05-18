@@ -12,3 +12,5 @@ distilbert-stanford-imdb-final/
 stanford-imdb-results/
 
 imdb_reviews.db
+
+imdb_scraper_checkpoint.json

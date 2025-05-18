@@ -49,6 +49,11 @@ def add_required_columns():
         cursor.execute("ALTER TABLE reviews ADD COLUMN rating_vote_count TEXT")
         print("Added rating_vote_count column to the database")
     
+    # Add movie_genre column if it doesn't exist
+    if "movie_genre" not in columns:
+        cursor.execute("ALTER TABLE reviews ADD COLUMN movie_genre TEXT")
+        print("Added movie_genre column to the database")
+    
     conn.commit()
     conn.close()
 
@@ -98,28 +103,34 @@ def load_checkpoint():
     
     return checkpoint_data
 
-# Update the database with the histogram data and separate rating fields
-def update_movie_data(movie_url, histogram_data):
+# Update the database with the histogram data, separate rating fields, and movie genres
+def update_movie_data(movie_url, movie_data):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
-    # Extract average rating and vote count from histogram data
+    # Extract data from the movie_data dictionary
+    histogram_data = movie_data.get("histogram_data", {})
     average_rating = histogram_data.get("average_rating") 
     vote_count = histogram_data.get("vote_count")
+    movie_genre = movie_data.get("movie_genre")
+    
+    # Convert genres list to JSON string
+    genres_json = json.dumps(movie_genre) if movie_genre else None
     
     # Convert histogram data to JSON string
-    histogram_json = json.dumps(histogram_data)
+    histogram_json = json.dumps(histogram_data) if histogram_data else None
     
-    # Update all reviews for this movie URL with all three fields
+    # Update all reviews for this movie URL with all fields
     cursor.execute(
         """
         UPDATE reviews 
         SET user_review_histogram = ?, 
             movie_average_rating = ?,
-            rating_vote_count = ?
+            rating_vote_count = ?,
+            movie_genre = ?
         WHERE movie_url = ?
         """,
-        (histogram_json, average_rating, vote_count, movie_url)
+        (histogram_json, average_rating, vote_count, genres_json, movie_url)
     )
     
     updated_rows = cursor.rowcount
@@ -127,6 +138,27 @@ def update_movie_data(movie_url, histogram_data):
     conn.close()
     
     return updated_rows
+
+# Extract movie genres from the page
+def extract_movie_genres(page):
+    try:
+        # Find the interests/genres container
+        genres_container = page.query_selector('div[data-testid="interests"]')
+        
+        if not genres_container:
+            return None
+        
+        # Extract all chip elements that contain the genres
+        genre_elements = genres_container.query_selector_all('a.ipc-chip span.ipc-chip__text')
+        
+        # Extract the text from each genre element
+        genres = [genre.text_content().strip() for genre in genre_elements if genre.text_content()]
+        
+        return genres
+        
+    except Exception as e:
+        print(f"Error extracting movie genres: {e}")
+        return None
 
 # Extract histogram data using precise selectors
 def extract_histogram_data(page):
@@ -178,6 +210,26 @@ def extract_histogram_data(page):
         print(f"Error extracting histogram data: {e}")
         return None
 
+# Extract all movie data from the page
+def extract_movie_data(page):
+    # Initialize the movie data dictionary
+    movie_data = {
+        "histogram_data": None,
+        "movie_genre": None
+    }
+    
+    # Extract histogram data
+    histogram_data = extract_histogram_data(page)
+    if histogram_data:
+        movie_data["histogram_data"] = histogram_data
+    
+    # Extract movie genres
+    movie_genre = extract_movie_genres(page)
+    if movie_genre:
+        movie_data["movie_genre"] = movie_genre
+    
+    return movie_data
+
 # Process all URLs in a single browser session
 def process_urls(url_data, start_index=0):
     global shutting_down
@@ -214,27 +266,34 @@ def process_urls(url_data, start_index=0):
                 # Navigate to the URL
                 page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 
-                # Wait for the histogram to load
+                # Wait for either the histogram or the genres to load
                 try:
-                    page.wait_for_selector('div[data-testid="rating-histogram"]', timeout=10000)
+                    page.wait_for_selector('div[data-testid="rating-histogram"], div[data-testid="interests"]', timeout=10000)
                 except Exception:
-                    print(f"Histogram not found for {url}")
+                    print(f"No rating histogram or genres found for {url}")
                     page.close()
                     continue
                 
-                # Extract histogram data
-                histogram_data = extract_histogram_data(page)
+                # Extract all movie data
+                movie_data = extract_movie_data(page)
                 
                 # Close the page
                 page.close()
                 
-                if histogram_data:
-                    # Update the database with histogram data and separate fields
-                    updated = update_movie_data(url, histogram_data)
+                # Update the database if we found any data
+                if movie_data and (movie_data["histogram_data"] or movie_data["movie_genre"]):
+                    # Update the database with all collected data
+                    updated = update_movie_data(url, movie_data)
                     print(f"Updated {updated} reviews for URL: {url}")
-                    print(f"Average Rating: {histogram_data.get('average_rating')}, Vote Count: {histogram_data.get('vote_count')}")
+                    
+                    # Log the data we found
+                    if movie_data["histogram_data"]:
+                        print(f"Average Rating: {movie_data['histogram_data'].get('average_rating')}, Vote Count: {movie_data['histogram_data'].get('vote_count')}")
+                    
+                    if movie_data["movie_genre"]:
+                        print(f"Movie Genres: {', '.join(movie_data['movie_genre'])}")
                 else:
-                    print(f"No histogram data found for {url}")
+                    print(f"No data found for {url}")
                 
                 # Update completed count
                 completed += 1
@@ -281,7 +340,7 @@ def main():
     current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"Current Date and Time (UTC - YYYY-MM-DD HH:MM:SS formatted): {current_time}")
     print(f"Current User's Login: {os.getenv('USER', 'taifuranowar')}")
-    print(f"Starting IMDB histogram scraping...")
+    print(f"Starting IMDB data scraping...")
     
     # Check if the database exists
     if not os.path.exists(DB_PATH):
@@ -297,7 +356,7 @@ def main():
     
     # Check if there are any URLs to process
     if not url_data:
-        print("No URLs to process. All histograms may have been collected already.")
+        print("No URLs to process. All movie data may have been collected already.")
         return
     
     # Check for checkpoint and determine starting point
@@ -329,7 +388,7 @@ def main():
             print("Checkpoint file removed as all URLs were processed successfully.")
     
     duration = time.time() - start_time
-    print(f"Histogram scraping completed in {duration:.2f} seconds")
+    print(f"Movie data scraping completed in {duration:.2f} seconds")
     if total_processed > start_index:
         print(f"Average time per URL: {duration/(total_processed-start_index):.2f} seconds")
 
