@@ -30,36 +30,31 @@ signal.signal(signal.SIGINT, signal_handler)
 def add_required_columns():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
+
     # Check existing columns
     cursor.execute("PRAGMA table_info(reviews)")
     columns = [info[1] for info in cursor.fetchall()]
-    
-    # Add histogram column if it doesn't exist
+
+    # Add columns as needed
     if "user_review_histogram" not in columns:
         cursor.execute("ALTER TABLE reviews ADD COLUMN user_review_histogram TEXT")
         print("Added user_review_histogram column to the database")
-    
-    # Add movie_average_rating column if it doesn't exist
     if "movie_average_rating" not in columns:
         cursor.execute("ALTER TABLE reviews ADD COLUMN movie_average_rating TEXT")
         print("Added movie_average_rating column to the database")
-    
-    # Add rating_vote_count column if it doesn't exist
     if "rating_vote_count" not in columns:
         cursor.execute("ALTER TABLE reviews ADD COLUMN rating_vote_count TEXT")
         print("Added rating_vote_count column to the database")
-    
-    # Add movie_genre column if it doesn't exist
     if "movie_genre" not in columns:
         cursor.execute("ALTER TABLE reviews ADD COLUMN movie_genre TEXT")
         print("Added movie_genre column to the database")
-    
-    # Add plot_keywords column if it doesn't exist
     if "plot_keywords" not in columns:
         cursor.execute("ALTER TABLE reviews ADD COLUMN plot_keywords TEXT")
         print("Added plot_keywords column to the database")
-    
+    if "movie_name" not in columns:
+        cursor.execute("ALTER TABLE reviews ADD COLUMN movie_name TEXT")
+        print("Added movie_name column to the database")
+
     conn.commit()
     conn.close()
 
@@ -67,73 +62,59 @@ def add_required_columns():
 def get_movie_urls_with_ids():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
-    # Get distinct movie URLs with the minimum row ID for each URL
     cursor.execute("""
         SELECT movie_url, MIN(id) as first_id
         FROM reviews 
         WHERE user_review_histogram IS NULL
         GROUP BY movie_url
     """)
-    
     url_data = [(row[0], row[1]) for row in cursor.fetchall()]
     conn.close()
     return url_data
 
-# Extract the movie ID from the URL
 def extract_movie_id(url):
     match = re.search(r'/title/(tt\d+)/', url)
     if match:
         return match.group(1)
     return None
 
-# Save checkpoint with the last processed database ID
 def save_checkpoint(row_id, url, processed_count, total_count):
     checkpoint_data = {
         "last_processed_id": row_id,
-        "last_processed_url": url,  # Just for logging/display purposes
+        "last_processed_url": url,
         "processed_count": processed_count,
         "total_count": total_count,
         "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     }
-    
     with open(CHECKPOINT_FILE, 'w') as f:
         json.dump(checkpoint_data, f, indent=2)
-    
     print(f"Checkpoint saved: {processed_count}/{total_count} URLs processed (Last ID: {row_id})")
 
-# Load checkpoint to resume scraping
 def load_checkpoint():
     if not os.path.exists(CHECKPOINT_FILE):
         return None
-    
     with open(CHECKPOINT_FILE, 'r') as f:
         checkpoint_data = json.load(f)
-    
     print(f"Checkpoint found from {checkpoint_data['timestamp']}")
     print(f"Resuming after database ID: {checkpoint_data['last_processed_id']}")
     print(f"Previously processed: {checkpoint_data['processed_count']}/{checkpoint_data['total_count']} URLs")
-    
     return checkpoint_data
 
 # Update the database with all movie data
 def update_movie_data(movie_url, movie_data):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
-    # Extract data from the movie_data dictionary
     histogram_data = movie_data.get("histogram_data", {})
-    average_rating = histogram_data.get("average_rating") 
+    average_rating = histogram_data.get("average_rating")
     vote_count = histogram_data.get("vote_count")
     movie_genre = movie_data.get("movie_genre")
     plot_keywords = movie_data.get("plot_keywords")
-    
-    # Convert data to JSON strings
+    movie_name = movie_data.get("movie_name")
+
     genres_json = json.dumps(movie_genre) if movie_genre else None
     keywords_json = json.dumps(plot_keywords) if plot_keywords else None
     histogram_json = json.dumps(histogram_data) if histogram_data else None
-    
-    # Update all reviews for this movie URL with all fields
+
     cursor.execute(
         """
         UPDATE reviews 
@@ -141,95 +122,76 @@ def update_movie_data(movie_url, movie_data):
             movie_average_rating = ?,
             rating_vote_count = ?,
             movie_genre = ?,
-            plot_keywords = ?
+            plot_keywords = ?,
+            movie_name = ?
         WHERE movie_url = ?
         """,
-        (histogram_json, average_rating, vote_count, genres_json, keywords_json, movie_url)
+        (histogram_json, average_rating, vote_count, genres_json, keywords_json, movie_name, movie_url)
     )
-    
+
     updated_rows = cursor.rowcount
     conn.commit()
     conn.close()
-    
     return updated_rows
 
-# Extract plot keywords from the keywords page
+def extract_movie_name(page):
+    try:
+        h1 = page.query_selector('h1[data-testid="hero__pageTitle"] span[data-testid="hero__primary-text"]')
+        if h1:
+            return h1.text_content().strip()
+        # Fallback: Try just the h1
+        h1_only = page.query_selector('h1[data-testid="hero__pageTitle"]')
+        if h1_only:
+            return h1_only.text_content().strip()
+        return None
+    except Exception as e:
+        print(f"Error extracting movie name: {e}")
+        return None
+
 def extract_plot_keywords(page, movie_url):
     try:
-        # Extract movie ID from URL
         movie_id = extract_movie_id(movie_url)
         if not movie_id:
             print(f"Could not extract movie ID from URL: {movie_url}")
             return None
-        
-        # Construct keywords URL
         keywords_url = f"https://www.imdb.com/title/{movie_id}/keywords/"
-        
-        # Navigate to the keywords page
         print(f"Navigating to keywords page: {keywords_url}")
         page.goto(keywords_url, wait_until="domcontentloaded", timeout=60000)
-        
-        # Wait for keywords to load
         try:
             page.wait_for_selector('ul.ipc-metadata-list li[data-testid="list-summary-item"]', timeout=10000)
         except Exception as e:
             print(f"No keywords found for {movie_url}: {e}")
             return None
-        
-        # Extract all keyword elements
         keyword_elements = page.query_selector_all('li[data-testid="list-summary-item"] a.ipc-metadata-list-summary-item__t')
-        
-        # Extract the text from each keyword element
         keywords = [keyword.text_content().strip() for keyword in keyword_elements if keyword.text_content()]
-        
         print(f"Found {len(keywords)} keywords for {movie_url}")
         return keywords
-        
     except Exception as e:
         print(f"Error extracting plot keywords: {e}")
         return None
 
-# Extract movie genres from the page
 def extract_movie_genres(page):
     try:
-        # Find the interests/genres container
         genres_container = page.query_selector('div[data-testid="interests"]')
-        
         if not genres_container:
             return None
-        
-        # Extract all chip elements that contain the genres
         genre_elements = genres_container.query_selector_all('a.ipc-chip span.ipc-chip__text')
-        
-        # Extract the text from each genre element
         genres = [genre.text_content().strip() for genre in genre_elements if genre.text_content()]
-        
         return genres
-        
     except Exception as e:
         print(f"Error extracting movie genres: {e}")
         return None
 
-# Extract histogram data using precise selectors
 def extract_histogram_data(page):
     try:
-        # Find the histogram container
         histogram_container = page.query_selector('div[data-testid="rating-histogram"]')
-        
         if not histogram_container:
             return None
-            
-        # Extract review counts for each rating
         histogram = {}
-        
-        # Use the histogram bars to extract data
         for rating in range(1, 11):
-            # Try to find the specific bar
             bar_selector = f'a[data-testid="rating-histogram-bar-{rating}"]'
             bar = page.query_selector(bar_selector)
-            
             if bar:
-                # Get the aria-label which contains the count information
                 aria_label = bar.get_attribute('aria-label')
                 if aria_label:
                     count_match = re.search(r'(\d+)', aria_label)
@@ -239,69 +201,47 @@ def extract_histogram_data(page):
                         histogram[str(rating)] = 0
             else:
                 histogram[str(rating)] = 0
-        
-        # Get the overall rating and vote count
         rating_element = page.query_selector('span[data-testid="rating-histogram-star"] span.ipc-rating-star--rating')
         vote_count_element = page.query_selector('span[data-testid="rating-histogram-vote-count"]')
-        
         rating = rating_element.text_content() if rating_element else None
         vote_count = vote_count_element.text_content() if vote_count_element else None
-        
-        # Compile the complete histogram data
         histogram_data = {
             "average_rating": rating,
             "vote_count": vote_count,
             "rating_distribution": histogram
         }
-        
         return histogram_data
-        
     except Exception as e:
         print(f"Error extracting histogram data: {e}")
         return None
 
-# Extract all movie data from the page
 def extract_movie_data(page, movie_url):
-    # Initialize the movie data dictionary
     movie_data = {
         "histogram_data": None,
         "movie_genre": None,
-        "plot_keywords": None
+        "plot_keywords": None,
+        "movie_name": None
     }
     
-    # Extract histogram data
-    histogram_data = extract_histogram_data(page)
-    if histogram_data:
-        movie_data["histogram_data"] = histogram_data
+    # First extract movie name from the main page
+    movie_data["movie_name"] = extract_movie_name(page)
     
-    # Extract movie genres
-    movie_genre = extract_movie_genres(page)
-    if movie_genre:
-        movie_data["movie_genre"] = movie_genre
+    # Then extract other data that exists on the main page
+    movie_data["histogram_data"] = extract_histogram_data(page)
+    movie_data["movie_genre"] = extract_movie_genres(page)
     
-    # Extract plot keywords (this will navigate to a different page)
-    plot_keywords = extract_plot_keywords(page, movie_url)
-    if plot_keywords:
-        movie_data["plot_keywords"] = plot_keywords
+    # Finally extract plot keywords (which requires navigation to another page)
+    movie_data["plot_keywords"] = extract_plot_keywords(page, movie_url)
     
     return movie_data
 
-# Process all URLs in a single browser session
 def process_urls(url_data, start_index=0):
     global shutting_down
-    
     with sync_playwright() as p:
-        # Launch a single browser instance - visible (not headless)
         print("Launching browser...")
         browser = p.chromium.launch(headless=False)
-        
-        # Create a single context for the entire session
         context = browser.new_context()
-        
-        # Create a single page for reuse
         page = context.new_page()
-        
-        # Process URLs sequentially
         completed = start_index
         total = len(url_data)
         
@@ -319,23 +259,25 @@ def process_urls(url_data, start_index=0):
             try:
                 print(f"Processing: {url} (ID: {row_id})")
                 
-                # Navigate to the main movie URL
+                # Navigate to the main movie page
                 page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 
-                # Wait for either the histogram or the genres to load
+                # Wait for important elements to load
                 try:
-                    page.wait_for_selector('div[data-testid="rating-histogram"], div[data-testid="interests"]', timeout=10000)
+                    # Wait for either histogram, genres, or the page title
+                    page.wait_for_selector('div[data-testid="rating-histogram"], div[data-testid="interests"], h1[data-testid="hero__pageTitle"]', timeout=10000)
                 except Exception:
-                    print(f"No rating histogram or genres found for {url}")
+                    print(f"No main data elements found for {url}")
                     continue
                 
-                # Extract all movie data (including keywords from separate page)
+                # Extract all movie data
                 movie_data = extract_movie_data(page, url)
                 
-                # Update the database if we found any data
+                # Check if we found any data
                 has_data = (movie_data["histogram_data"] or 
                            movie_data["movie_genre"] or 
-                           movie_data["plot_keywords"])
+                           movie_data["plot_keywords"] or
+                           movie_data["movie_name"])
                 
                 if has_data:
                     # Update the database with all collected data
@@ -343,6 +285,9 @@ def process_urls(url_data, start_index=0):
                     print(f"Updated {updated} reviews for URL: {url}")
                     
                     # Log the data we found
+                    if movie_data["movie_name"]:
+                        print(f"Movie Name: {movie_data['movie_name']}")
+                    
                     if movie_data["histogram_data"]:
                         print(f"Average Rating: {movie_data['histogram_data'].get('average_rating')}, Vote Count: {movie_data['histogram_data'].get('vote_count')}")
                     
