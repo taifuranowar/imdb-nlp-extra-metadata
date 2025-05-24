@@ -14,3 +14,5 @@ stanford-imdb-results/
 imdb_reviews.db
 
 imdb_scraper_checkpoint.json
+
+metadata-imdb-results/
