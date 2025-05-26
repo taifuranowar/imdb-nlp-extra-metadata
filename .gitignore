@@ -16,3 +16,5 @@ imdb_reviews.db
 imdb_scraper_checkpoint.json
 
 metadata-imdb-results/
+
+distilbert-metadata-imdb-final/

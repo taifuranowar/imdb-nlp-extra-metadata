@@ -3,6 +3,7 @@ import re
 import json
 import sqlite3
 import numpy as np
+import time
 import torch
 from torch.utils.data import Dataset, DataLoader, random_split
 from transformers import (
@@ -12,6 +13,7 @@ from transformers import (
     Trainer
 )
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from datetime import datetime
 
 # Constants
 DB_PATH = "imdb_reviews.db"
@@ -63,6 +65,173 @@ class IMDBMetadataDataset(Dataset):
             'attention_mask': encoding['attention_mask'].flatten(),
             'label': torch.tensor(label, dtype=torch.long)
         }
+        
+def create_archive_directory(base_dir="./distilbert-metadata-imdb-archive"):
+    """Create timestamped archive directory at the beginning of the experiment"""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    archive_dir = f"{base_dir}_{timestamp}"
+    os.makedirs(archive_dir, exist_ok=True)
+    
+    # Create subdirectories for organization
+    os.makedirs(os.path.join(archive_dir, "model"), exist_ok=True)
+    os.makedirs(os.path.join(archive_dir, "tokenizer"), exist_ok=True)
+    os.makedirs(os.path.join(archive_dir, "training_outputs"), exist_ok=True)
+    os.makedirs(os.path.join(archive_dir, "logs"), exist_ok=True)
+    os.makedirs(os.path.join(archive_dir, "metadata"), exist_ok=True)
+    os.makedirs(os.path.join(archive_dir, "predictions"), exist_ok=True)
+
+    print(f"Created archive directory: {archive_dir}")
+    return archive_dir
+
+def finalize_archive(model, tokenizer, test_dataset, training_args, eval_results, config, archive_dir):
+    """Finalize the archive with evaluation results and model artifacts"""
+    print(f"Finalizing experiment archive in {archive_dir}...")
+    
+    # 1. Save model & tokenizer
+    print("Saving model and tokenizer...")
+    model_dir = os.path.join(archive_dir, "model")
+    tokenizer_dir = os.path.join(archive_dir, "tokenizer")
+    model.save_pretrained(model_dir)
+    tokenizer.save_pretrained(tokenizer_dir)
+    
+    # 2. Save test data structure with metadata
+    print("Saving test data structure...")
+    metadata_dir = os.path.join(archive_dir, "metadata")
+    
+    # Save metadata format and config
+    with open(os.path.join(metadata_dir, "metadata_config.json"), "w") as f:
+        json.dump({
+            "fusion_type": config.get("fusion_technique", "unknown"),
+            "metadata_fields": config.get("metadata", {})
+        }, f, indent=2)
+    
+    # Save sample test data (100 samples or less)
+    sample_size = min(100, len(test_dataset))
+    sample_data = []
+    for i in range(sample_size):
+        sample_data.append({
+            "text": test_dataset.reviews[i] if hasattr(test_dataset, "reviews") else "",
+            "label": int(test_dataset.labels[i]),
+            "metadata": test_dataset.metadata[i] if hasattr(test_dataset, "metadata") else {}
+        })
+    
+    with open(os.path.join(metadata_dir, "test_samples.json"), "w") as f:
+        json.dump(sample_data, f, indent=2)
+        
+    # 3. Save model predictions on test set
+    print("Saving model predictions...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+    
+    # Create dataloader
+    test_loader = DataLoader(test_dataset, batch_size=16)
+    
+    all_preds = []
+    all_logits = []
+    all_labels = []
+    
+    with torch.no_grad():
+        for batch in test_loader:
+            inputs = {k: v.to(device) for k, v in batch.items() if k != 'label'}
+            labels = batch["label"]
+            
+            outputs = model(**inputs)
+            preds = torch.argmax(outputs.logits, dim=-1)
+            
+            all_preds.append(preds.cpu().numpy())
+            all_logits.append(outputs.logits.cpu().numpy())
+            all_labels.append(labels.numpy())
+    
+    all_preds = np.concatenate(all_preds)
+    all_logits = np.concatenate(all_logits)
+    all_labels = np.concatenate(all_labels)
+    
+    # Save predictions
+    predictions_dir = os.path.join(archive_dir, "predictions")
+    np.save(os.path.join(predictions_dir, "predictions.npy"), all_preds)
+    np.save(os.path.join(predictions_dir, "logits.npy"), all_logits)
+    np.save(os.path.join(predictions_dir, "labels.npy"), all_labels)
+    
+    # 4. Save evaluation metrics and comprehensive config
+    print("Saving evaluation metrics and configuration...")
+    
+    # Count parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    # Measure inference time for a single sample
+    sample_input = test_dataset[0]
+    inputs = {
+        'input_ids': sample_input['input_ids'].unsqueeze(0).to(device),
+        'attention_mask': sample_input['attention_mask'].unsqueeze(0).to(device)
+    }
+    
+    # Warm up
+    for _ in range(10):
+        with torch.no_grad():
+            _ = model(**inputs)
+    
+    # Measure time
+    start_time = time.time()
+    with torch.no_grad():
+        for _ in range(100):  # Multiple iterations for accuracy
+            _ = model(**inputs)
+    inference_time = (time.time() - start_time) / 100 * 1000  # ms
+    
+    # Enhanced config with all paths and settings
+    enhanced_config = {
+        **config,
+        "paths": {
+            "model_dir": os.path.abspath(model_dir),
+            "tokenizer_dir": os.path.abspath(tokenizer_dir),
+            "training_output_dir": os.path.abspath(training_args.output_dir),
+            "log_dir": os.path.abspath(training_args.logging_dir),
+            "predictions_dir": os.path.abspath(predictions_dir)
+        },
+        "training": training_args.to_dict(),
+        "system_info": {
+            "device": str(device),
+            "cuda_available": torch.cuda.is_available(),
+            "cuda_device_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+        }
+    }
+    
+    # Save the config
+    with open(os.path.join(archive_dir, "experiment_config.json"), "w") as f:
+        json.dump(enhanced_config, f, indent=2)
+    
+    # Add additional metrics to eval_results
+    complete_results = {
+        **eval_results,
+        "parameter_count": int(total_params),
+        "trainable_parameter_count": int(trainable_params),
+        "inference_time_ms": float(inference_time),
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "device": str(device)
+    }
+    
+    with open(os.path.join(archive_dir, "evaluation_results.json"), "w") as f:
+        json.dump(complete_results, f, indent=2)
+    
+    # 5. Save experiment summary
+    summary = {
+        "experiment_id": os.path.basename(archive_dir),
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "model": config.get("model_name", "distilbert-base-uncased"),
+        "fusion_technique": config.get("fusion_technique", "early_fusion"),
+        "metadata_fields": config.get("metadata", {}),
+        "accuracy": eval_results.get("eval_accuracy", 0) * 100,
+        "f1_score": eval_results.get("eval_f1", 0) * 100,
+        "parameter_count": int(total_params),
+        "inference_time_ms": float(inference_time),
+    }
+    
+    with open(os.path.join(archive_dir, "experiment_summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+    
+    print(f"Archive complete! All data saved to {archive_dir}")
+    return archive_dir
 
 def load_data_from_database():
     """Load reviews, labels, and metadata from SQLite database"""
@@ -165,6 +334,9 @@ def main():
         print("CUDA is not available. Training will be on CPU, which will be much slower.")
         print("If you have a GPU, make sure CUDA drivers are properly installed.")
     
+    # Create archive directory at the beginning
+    archive_dir = create_archive_directory()
+    
     # Load data from database
     print("Loading data from database...")
     train_reviews, train_labels, train_metadata, test_reviews, test_labels, test_metadata = load_data_from_database()
@@ -202,14 +374,14 @@ def main():
     print(f"Training dataset size: {len(train_dataset)}")
     print(f"Testing dataset size: {len(test_dataset)}")
     
-    # Training arguments - enable CUDA if available
+    # Training arguments - using archive directory paths
     training_args = TrainingArguments(
-        output_dir='./metadata-imdb-results',
+        output_dir=os.path.join(archive_dir, "training_outputs"),
         num_train_epochs=3,
         per_device_train_batch_size=16,
         per_device_eval_batch_size=16,
         weight_decay=0.01,
-        logging_dir='./logs',
+        logging_dir=os.path.join(archive_dir, "logs"),
         logging_steps=500,
         save_steps=1500,
         eval_steps=1500,
@@ -242,9 +414,42 @@ def main():
     print(f"Recall: {eval_results['eval_recall'] * 100:.2f}%")
     print(f"F1 Score: {eval_results['eval_f1'] * 100:.2f}%")
     
-    # Save the model
-    model.save_pretrained("./distilbert-metadata-imdb-final")
-    tokenizer.save_pretrained("./distilbert-metadata-imdb-final")
+    # Create comprehensive model archive - comprehensive configuration
+    config = {
+        "fusion_technique": "early_fusion",
+        "metadata": {
+            "genres": True,
+            "ratings": True,
+            "votes": True
+        },
+        "model_name": "distilbert-base-uncased",
+        "epochs": 3,
+        "batch_size": 16,
+        "max_length": MAX_LENGTH,
+        "experiment_date": datetime.now().strftime("%Y-%m-%d"),
+        "experiment_time": datetime.now().strftime("%H:%M:%S"),
+        "description": "IMDB sentiment analysis with metadata using early fusion technique"
+    }
+    
+    # Finalize archive with evaluation results and predictions
+    finalize_archive(
+        model=model,
+        tokenizer=tokenizer,
+        test_dataset=test_dataset,
+        training_args=training_args,
+        eval_results=eval_results,
+        config=config,
+        archive_dir=archive_dir
+    )
+    
+    print(f"Complete experiment archive created at {archive_dir}")
+    print(f"This archive contains everything needed for future analysis, including:")
+    print("- Trained model and tokenizer")
+    print("- Training checkpoints (directly saved to archive)")
+    print("- Logs (directly saved to archive)")
+    print("- Test data samples with metadata")
+    print("- Model predictions and evaluation metrics")
+    print("- Comprehensive configuration")
 
 if __name__ == "__main__":
     main()
