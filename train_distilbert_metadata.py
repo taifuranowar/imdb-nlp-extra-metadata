@@ -66,10 +66,13 @@ class IMDBMetadataDataset(Dataset):
             'label': torch.tensor(label, dtype=torch.long)
         }
         
-def create_archive_directory(base_dir="./distilbert-metadata-imdb-archive"):
+def create_archive_directory(base_dir="./training/distilbert-metadata-imdb-archive"):
     """Create timestamped archive directory at the beginning of the experiment"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     archive_dir = f"{base_dir}_{timestamp}"
+    
+    # Create the training directory if it doesn't exist
+    os.makedirs(os.path.dirname(archive_dir), exist_ok=True)
     os.makedirs(archive_dir, exist_ok=True)
     
     # Create subdirectories for organization
