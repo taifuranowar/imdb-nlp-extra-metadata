@@ -1,10 +1,11 @@
 import os
 import re
-import json
-import sqlite3
+import tarfile
+import urllib.request
 import numpy as np
 import time
 import torch
+import json
 from torch.utils.data import Dataset, DataLoader, random_split
 from transformers import (
     DistilBertForSequenceClassification,
@@ -16,14 +17,14 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from datetime import datetime
 
 # Constants
-DB_PATH = "imdb_reviews.db"
+DATASET_URL = "https://ai.stanford.edu/~amaas/data/sentiment/aclImdb_v1.tar.gz"
+DATASET_PATH = "./aclImdb"
 MAX_LENGTH = 512
 
-class IMDBMetadataDataset(Dataset):
-    def __init__(self, reviews, labels, metadata, tokenizer, max_length):
+class IMDBDataset(Dataset):
+    def __init__(self, reviews, labels, tokenizer, max_length):
         self.reviews = reviews
         self.labels = labels
-        self.metadata = metadata  # Dictionary with genres and ratings
         self.tokenizer = tokenizer
         self.max_length = max_length
         
@@ -34,26 +35,8 @@ class IMDBMetadataDataset(Dataset):
         review = self.reviews[idx]
         label = self.labels[idx]
         
-        # Extract metadata and add to review text
-        metadata_str = ""
-        
-        # Add genres if available
-        if self.metadata[idx].get('genres'):
-            genres = ", ".join(self.metadata[idx]['genres'])
-            metadata_str += f" [Genres: {genres}]"
-            
-        # Add ratings if available
-        if self.metadata[idx].get('rating'):
-            metadata_str += f" [Rating: {self.metadata[idx]['rating']}]"
-            
-        if self.metadata[idx].get('votes'):
-            metadata_str += f" [Votes: {self.metadata[idx]['votes']}]"
-            
-        # Combine review with metadata
-        enhanced_review = review + metadata_str
-        
         encoding = self.tokenizer(
-            enhanced_review,
+            review,
             truncation=True,
             padding='max_length',
             max_length=self.max_length,
@@ -65,8 +48,8 @@ class IMDBMetadataDataset(Dataset):
             'attention_mask': encoding['attention_mask'].flatten(),
             'label': torch.tensor(label, dtype=torch.long)
         }
-        
-def create_archive_directory(base_dir="./distilbert-metadata-imdb-archive"):
+
+def create_archive_directory(base_dir="./distilbert-wo-metadata-imdb-archive"):
     """Create timestamped archive directory at the beginning of the experiment"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     archive_dir = f"{base_dir}_{timestamp}"
@@ -77,9 +60,8 @@ def create_archive_directory(base_dir="./distilbert-metadata-imdb-archive"):
     os.makedirs(os.path.join(archive_dir, "tokenizer"), exist_ok=True)
     os.makedirs(os.path.join(archive_dir, "training_outputs"), exist_ok=True)
     os.makedirs(os.path.join(archive_dir, "logs"), exist_ok=True)
-    os.makedirs(os.path.join(archive_dir, "metadata"), exist_ok=True)
     os.makedirs(os.path.join(archive_dir, "predictions"), exist_ok=True)
-
+    
     print(f"Created archive directory: {archive_dir}")
     return archive_dir
 
@@ -94,28 +76,17 @@ def finalize_archive(model, tokenizer, test_dataset, training_args, eval_results
     model.save_pretrained(model_dir)
     tokenizer.save_pretrained(tokenizer_dir)
     
-    # 2. Save test data structure with metadata
-    print("Saving test data structure...")
-    metadata_dir = os.path.join(archive_dir, "metadata")
-    
-    # Save metadata format and config
-    with open(os.path.join(metadata_dir, "metadata_config.json"), "w") as f:
-        json.dump({
-            "fusion_type": config.get("fusion_technique", "unknown"),
-            "metadata_fields": config.get("metadata", {})
-        }, f, indent=2)
-    
-    # Save sample test data (100 samples or less)
+    # 2. Save sample test data (100 samples or less)
+    print("Saving test data samples...")
     sample_size = min(100, len(test_dataset))
     sample_data = []
     for i in range(sample_size):
         sample_data.append({
             "text": test_dataset.reviews[i] if hasattr(test_dataset, "reviews") else "",
-            "label": int(test_dataset.labels[i]),
-            "metadata": test_dataset.metadata[i] if hasattr(test_dataset, "metadata") else {}
+            "label": int(test_dataset.labels[i])
         })
     
-    with open(os.path.join(metadata_dir, "test_samples.json"), "w") as f:
+    with open(os.path.join(archive_dir, "test_samples.json"), "w") as f:
         json.dump(sample_data, f, indent=2)
         
     # 3. Save model predictions on test set
@@ -219,8 +190,7 @@ def finalize_archive(model, tokenizer, test_dataset, training_args, eval_results
         "experiment_id": os.path.basename(archive_dir),
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "model": config.get("model_name", "distilbert-base-uncased"),
-        "fusion_technique": config.get("fusion_technique", "early_fusion"),
-        "metadata_fields": config.get("metadata", {}),
+        "fusion_technique": config.get("fusion_technique", "text_only"),
         "accuracy": eval_results.get("eval_accuracy", 0) * 100,
         "f1_score": eval_results.get("eval_f1", 0) * 100,
         "parameter_count": int(total_params),
@@ -233,72 +203,47 @@ def finalize_archive(model, tokenizer, test_dataset, training_args, eval_results
     print(f"Archive complete! All data saved to {archive_dir}")
     return archive_dir
 
-def load_data_from_database():
-    """Load reviews, labels, and metadata from SQLite database"""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    # Query to get all necessary fields
-    cursor.execute("""
-        SELECT 
-            user_review_text, 
-            CASE WHEN user_review_sentiment = 'pos' THEN 1 ELSE 0 END as sentiment, 
-            movie_genre,
-            movie_average_rating,
-            rating_vote_count,
-            dataset_split
-        FROM reviews
-    """)
-    
-    # Process results
-    train_reviews = []
-    train_labels = []
-    train_metadata = []
-    
-    test_reviews = []
-    test_labels = []
-    test_metadata = []
-    
-    for row in cursor.fetchall():
-        review_text = row[0]
-        sentiment = row[1]
-        genre_json = row[2]
-        rating = row[3]
-        votes = row[4]
-        split = row[5]
+def download_and_extract_dataset():
+    """Download and extract the IMDB dataset if it doesn't exist"""
+    if not os.path.exists(DATASET_PATH):
+        print(f"Downloading IMDB dataset from {DATASET_URL}...")
+        filename, _ = urllib.request.urlretrieve(DATASET_URL, "aclImdb_v1.tar.gz")
         
-        # Skip rows with missing data
-        if not review_text:
-            continue
+        print("Extracting dataset...")
+        with tarfile.open(filename, 'r:gz') as tar:
+            tar.extractall()
         
-        # Parse genres from JSON
-        genres = []
-        if genre_json:
-            try:
-                genres = json.loads(genre_json)
-            except (json.JSONDecodeError, TypeError):
-                pass
-        
-        # Create metadata dictionary
-        metadata = {
-            'genres': genres,
-            'rating': rating,
-            'votes': votes
-        }
-        
-        # Add to appropriate split
-        if split == 'train':
-            train_reviews.append(review_text)
-            train_labels.append(sentiment)
-            train_metadata.append(metadata)
-        elif split == 'test':
-            test_reviews.append(review_text)
-            test_labels.append(sentiment)
-            test_metadata.append(metadata)
+        os.remove(filename)
+        print("Dataset downloaded and extracted successfully.")
+    else:
+        print("Dataset already exists. Skipping download.")
+
+def load_dataset_from_directory(directory):
+    """Load reviews and labels from directory"""
+    reviews = []
+    labels = []
     
-    conn.close()
+    # Load positive reviews (label=1)
+    pos_dir = os.path.join(directory, 'pos')
+    if os.path.exists(pos_dir):
+        for filename in os.listdir(pos_dir):
+            if filename.endswith('.txt'):
+                with open(os.path.join(pos_dir, filename), 'r', encoding='utf-8') as f:
+                    text = f.read()
+                    reviews.append(text)
+                    labels.append(1)
     
-    return train_reviews, train_labels, train_metadata, test_reviews, test_labels, test_metadata
+    # Load negative reviews (label=0)
+    neg_dir = os.path.join(directory, 'neg')
+    if os.path.exists(neg_dir):
+        for filename in os.listdir(neg_dir):
+            if filename.endswith('.txt'):
+                with open(os.path.join(neg_dir, filename), 'r', encoding='utf-8') as f:
+                    text = f.read()
+                    reviews.append(text)
+                    labels.append(0)
+    
+    return reviews, labels
 
 def clean_text(text):
     """Clean the text by removing HTML tags and normalizing whitespace"""
@@ -337,14 +282,8 @@ def main():
     # Create archive directory at the beginning
     archive_dir = create_archive_directory()
     
-    # Load data from database
-    print("Loading data from database...")
-    train_reviews, train_labels, train_metadata, test_reviews, test_labels, test_metadata = load_data_from_database()
-    
-    # Clean text
-    print("Cleaning text...")
-    train_reviews = [clean_text(review) for review in train_reviews]
-    test_reviews = [clean_text(review) for review in test_reviews]
+    # Download and extract the dataset
+    download_and_extract_dataset()
     
     # Load tokenizer and model
     tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
@@ -353,23 +292,23 @@ def main():
         num_labels=2
     )
     
+    # Load and preprocess the training data
+    print("Loading training data...")
+    train_reviews, train_labels = load_dataset_from_directory(os.path.join(DATASET_PATH, 'train'))
+    
+    # Clean text
+    print("Cleaning text...")
+    train_reviews = [clean_text(review) for review in train_reviews]
+    
+    # Load and preprocess the test data
+    print("Loading test data...")
+    test_reviews, test_labels = load_dataset_from_directory(os.path.join(DATASET_PATH, 'test'))
+    test_reviews = [clean_text(review) for review in test_reviews]
+    
     # Create datasets
     print("Creating datasets...")
-    train_dataset = IMDBMetadataDataset(
-        train_reviews, 
-        train_labels, 
-        train_metadata, 
-        tokenizer, 
-        MAX_LENGTH
-    )
-    
-    test_dataset = IMDBMetadataDataset(
-        test_reviews, 
-        test_labels, 
-        test_metadata, 
-        tokenizer, 
-        MAX_LENGTH
-    )
+    train_dataset = IMDBDataset(train_reviews, train_labels, tokenizer, MAX_LENGTH)
+    test_dataset = IMDBDataset(test_reviews, test_labels, tokenizer, MAX_LENGTH)
     
     print(f"Training dataset size: {len(train_dataset)}")
     print(f"Testing dataset size: {len(test_dataset)}")
@@ -414,21 +353,16 @@ def main():
     print(f"Recall: {eval_results['eval_recall'] * 100:.2f}%")
     print(f"F1 Score: {eval_results['eval_f1'] * 100:.2f}%")
     
-    # Create comprehensive model archive - comprehensive configuration
+    # Create comprehensive experiment configuration
     config = {
-        "fusion_technique": "early_fusion",
-        "metadata": {
-            "genres": True,
-            "ratings": True,
-            "votes": True
-        },
+        "fusion_technique": "text_only",
         "model_name": "distilbert-base-uncased",
         "epochs": 3,
         "batch_size": 16,
         "max_length": MAX_LENGTH,
         "experiment_date": datetime.now().strftime("%Y-%m-%d"),
         "experiment_time": datetime.now().strftime("%H:%M:%S"),
-        "description": "IMDB sentiment analysis with metadata using early fusion technique"
+        "description": "IMDB sentiment analysis using text only (without metadata)"
     }
     
     # Finalize archive with evaluation results and predictions

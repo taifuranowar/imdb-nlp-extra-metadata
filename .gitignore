@@ -18,3 +18,11 @@ imdb_scraper_checkpoint.json
 metadata-imdb-results/
 
 distilbert-metadata-imdb-final/
+
+distilbert-metadata-imdb-archive_20250527_0916/
+
+distilbert-metadata-imdb-archive_20250530_1503/
+
+distilbert-wo-metadata-imdb-archive_20250530_1315/
+
+distilbert-wo-metadata-imdb-archive_20250530_1406/
