@@ -8,141 +8,66 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
 from transformers import (
-    DistilBertForSequenceClassification,
-    DistilBertTokenizer,
     DistilBertModel,
+    DistilBertTokenizer,
+    DistilBertConfig,
     TrainingArguments, 
     Trainer
 )
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from datetime import datetime
+from collections import Counter
 
 # Constants
 DB_PATH = "imdb_reviews.db"
 MAX_LENGTH = 512
 
-class LateFusionDistilBertModel(nn.Module):
-    """DistilBERT with late fusion for metadata integration"""
+def get_all_genres_from_database():
+    """Extract all unique genres from the database"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
     
-    def __init__(self, model_name='distilbert-base-uncased', num_labels=2, metadata_dim=10):
-        super().__init__()
-        
-        # Text encoder (DistilBERT)
-        self.distilbert = DistilBertModel.from_pretrained(model_name)
-        self.text_dim = self.distilbert.config.hidden_size  # 768 for DistilBERT
-        
-        # Metadata encoder
-        self.metadata_encoder = nn.Sequential(
-            nn.Linear(metadata_dim, 64),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.Dropout(0.1)
-        )
-        
-        # Fusion layer
-        fusion_dim = self.text_dim + 32  # Text features + encoded metadata
-        self.fusion_layer = nn.Sequential(
-            nn.Linear(fusion_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(256, 64),
-            nn.ReLU(),
-            nn.Dropout(0.1)
-        )
-        
-        # Classification head
-        self.classifier = nn.Linear(64, num_labels)
-        
-    def forward(self, input_ids, attention_mask, metadata_features, labels=None):
-        # Process text with DistilBERT
-        text_outputs = self.distilbert(
-            input_ids=input_ids,
-            attention_mask=attention_mask
-        )
-        
-        # Use [CLS] token representation
-        text_features = text_outputs.last_hidden_state[:, 0, :]  # [batch_size, 768]
-        
-        # Process metadata
-        metadata_encoded = self.metadata_encoder(metadata_features)  # [batch_size, 32]
-        
-        # Late fusion: concatenate text and metadata features
-        fused_features = torch.cat([text_features, metadata_encoded], dim=1)
-        
-        # Final classification
-        fused_encoded = self.fusion_layer(fused_features)
-        logits = self.classifier(fused_encoded)
-        
-        loss = None
-        if labels is not None:
-            loss_fct = nn.CrossEntropyLoss()
-            loss = loss_fct(logits, labels)
+    # Query to get all genre data
+    cursor.execute("SELECT movie_genre FROM reviews WHERE movie_genre IS NOT NULL")
     
-        # Use proper SequenceClassifierOutput instead of custom type
-        from transformers.modeling_outputs import SequenceClassifierOutput
+    # Process results
+    genre_counter = Counter()
     
-        return SequenceClassifierOutput(
-            loss=loss,
-            logits=logits,
-            hidden_states=None,
-            attentions=None
-        )
+    for (genre_json,) in cursor.fetchall():
+        if genre_json:
+            try:
+                genres = json.loads(genre_json)
+                for genre in genres:
+                    genre_counter[genre] += 1
+            except (json.JSONDecodeError, TypeError):
+                pass
+    
+    conn.close()
+    
+    # Get the most common genres (e.g., top 20)
+    top_genres = [genre for genre, _ in genre_counter.most_common(20)]
+    print(f"Found {len(top_genres)} most common genres: {', '.join(top_genres)}")
+    
+    return top_genres
 
 class IMDBLateFusionDataset(Dataset):
-    def __init__(self, reviews, labels, metadata, tokenizer, max_length):
+    def __init__(self, reviews, labels, metadata, tokenizer, max_length, common_genres):
         self.reviews = reviews
         self.labels = labels
-        self.metadata = metadata
+        self.metadata = metadata  # Dictionary with genres and ratings
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.common_genres = common_genres
         
     def __len__(self):
         return len(self.reviews)
-    
-    def _encode_metadata(self, metadata_dict):
-        """Convert metadata to numerical features"""
-        features = np.zeros(10)  # Fixed size feature vector
-        
-        # Genre encoding (one-hot for top genres)
-        top_genres = ['Drama', 'Comedy', 'Action', 'Romance', 'Thriller']
-        if metadata_dict.get('genres'):
-            for i, genre in enumerate(top_genres):
-                if genre in metadata_dict['genres']:
-                    features[i] = 1.0
-    
-        # Rating (normalized)
-        rating_value = 0.0
-        if metadata_dict.get('rating'):
-            try:
-                rating_value = float(metadata_dict['rating'])
-                features[5] = rating_value / 10.0  # Normalize to 0-1
-            except (ValueError, TypeError):
-                features[5] = 0.5  # Default middle value
-    
-        # Votes (log-normalized)
-        votes_value = 0.0
-        if metadata_dict.get('votes'):
-            try:
-                votes_value = float(metadata_dict['votes'])
-                features[6] = min(np.log10(votes_value + 1) / 6.0, 1.0)  # Log normalize and cap at 1
-            except (ValueError, TypeError):
-                features[6] = 0.0
-    
-        # Additional features (can be expanded)
-        #features[7] = len(metadata_dict.get('genres', [])) / 5.0  # Number of genres normalized
-        #features[8] = 1.0 if rating_value > 7.0 else 0.0  # High rating flag - use converted rating_value
-        #features[9] = 1.0 if votes_value > 10000 else 0.0  # Popular movie flag - use converted votes_value
-    
-        return features
     
     def __getitem__(self, idx):
         review = self.reviews[idx]
         label = self.labels[idx]
         
-        # Tokenize only the text (no metadata concatenation)
-        encoding = self.tokenizer(
+        # Process review text separately
+        text_encoding = self.tokenizer(
             review,
             truncation=True,
             padding='max_length',
@@ -150,31 +75,119 @@ class IMDBLateFusionDataset(Dataset):
             return_tensors='pt'
         )
         
-        # Encode metadata separately
-        metadata_features = self._encode_metadata(self.metadata[idx])
+        # Process metadata as separate features
+        # Create feature vector for metadata
+        metadata_features = []
+        
+        # Add rating (normalized)
+        rating = self.metadata[idx].get('rating', 0)
+        if rating:
+            normalized_rating = float(rating) / 10.0  # Assuming rating is out of 10
+        else:
+            normalized_rating = 0.0
+        metadata_features.append(normalized_rating)
+        
+        # Add vote count (log-normalized)
+        votes = self.metadata[idx].get('votes', 0)
+        if votes:
+            # Log normalization to handle wide range of vote counts
+            log_votes = np.log1p(float(votes)) / 15.0  # Normalized by log(1M)
+        else:
+            log_votes = 0.0
+        metadata_features.append(log_votes)
+        
+        # Create one-hot encoding for dynamically determined genres
+        genre_features = [0] * len(self.common_genres)
+        
+        # Set 1 for each genre present
+        if self.metadata[idx].get('genres'):
+            for i, genre in enumerate(self.common_genres):
+                if genre in self.metadata[idx]['genres']:
+                    genre_features[i] = 1
+            
+        # Add all genre features to metadata_features
+        metadata_features.extend(genre_features)
         
         return {
-            'input_ids': encoding['input_ids'].flatten(),
-            'attention_mask': encoding['attention_mask'].flatten(),
-            'metadata_features': torch.tensor(metadata_features, dtype=torch.float32),
-            'labels': torch.tensor(label, dtype=torch.long)
+            'input_ids': text_encoding['input_ids'].flatten(),
+            'attention_mask': text_encoding['attention_mask'].flatten(),
+            'metadata_features': torch.tensor(metadata_features, dtype=torch.float),
+            'label': torch.tensor(label, dtype=torch.long)
         }
 
-class LateFusionTrainer(Trainer):
-    """Custom trainer for late fusion model"""
-    
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        labels = inputs.get("labels")
-        outputs = model(
-            input_ids=inputs.get("input_ids"),
-            attention_mask=inputs.get("attention_mask"), 
-            metadata_features=inputs.get("metadata_features"),
-            labels=labels
+class DistilBertLateFusion(nn.Module):
+    def __init__(self, num_labels=2, metadata_size=22):  # Default is 2 base features + 20 genres
+        super().__init__()
+        # Load DistilBERT for text processing
+        self.config = DistilBertConfig.from_pretrained('distilbert-base-uncased')
+        self.distilbert = DistilBertModel.from_pretrained('distilbert-base-uncased')
+        
+        # Metadata processing
+        self.metadata_encoder = nn.Sequential(
+            nn.Linear(metadata_size, 64),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, 64),
+            nn.ReLU()
         )
-        loss = outputs.loss
-        return (loss, outputs) if return_outputs else loss
+        
+        # Late fusion layer
+        self.fusion_layer = nn.Linear(self.config.dim + 64, self.config.dim)
+        
+        # Classification head
+        self.pre_classifier = nn.Linear(self.config.dim, self.config.dim)
+        self.dropout = nn.Dropout(0.2)
+        self.classifier = nn.Linear(self.config.dim, num_labels)
+        
+    def forward(self, input_ids, attention_mask, metadata_features, labels=None):
+        # Process text through DistilBERT
+        outputs = self.distilbert(input_ids=input_ids, attention_mask=attention_mask)
+        hidden_state = outputs.last_hidden_state[:, 0]  # Use CLS token
+        
+        # Process metadata features
+        metadata_encoded = self.metadata_encoder(metadata_features)
+        
+        # Late fusion by concatenation and projection
+        combined = torch.cat([hidden_state, metadata_encoded], dim=1)
+        fused = self.fusion_layer(combined)
+        
+        # Classification
+        pooled_output = self.pre_classifier(fused)
+        pooled_output = nn.ReLU()(pooled_output)
+        pooled_output = self.dropout(pooled_output)
+        logits = self.classifier(pooled_output)
+        
+        loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, 2), labels.view(-1))
+            
+        return torch.nn.functional.log_softmax(logits, dim=1) if loss is None else (loss, logits)
 
-def create_archive_directory(base_dir="./training/distilbert-late-fusion-metadata-imdb-archive"):
+class LateFusionTrainer(Trainer):
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # Check if 'label' or 'labels' is in the inputs
+        if 'label' in inputs:
+            labels = inputs.pop("label")
+        elif 'labels' in inputs:
+            labels = inputs.pop("labels")
+        else:
+            print("Available keys in inputs:", list(inputs.keys()))
+            raise KeyError("Neither 'label' nor 'labels' found in inputs")
+            
+        outputs = model(**inputs)
+        
+        if isinstance(outputs, tuple):
+            loss = outputs[0]
+            logits = outputs[1]
+        else:
+            logits = outputs
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits.view(-1, 2), labels.view(-1))
+            
+        return (loss, {"logits": logits}) if return_outputs else loss
+
+def create_archive_directory(base_dir="./training/distilbert-late-fusion-imdb-archive"):
     """Create timestamped archive directory at the beginning of the experiment"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     archive_dir = f"{base_dir}_{timestamp}"
@@ -203,18 +216,14 @@ def finalize_archive(model, tokenizer, test_dataset, training_args, eval_results
     model_dir = os.path.join(archive_dir, "model")
     tokenizer_dir = os.path.join(archive_dir, "tokenizer")
     
-    # Save the custom model
+    # Custom model needs special handling
     torch.save(model.state_dict(), os.path.join(model_dir, "pytorch_model.bin"))
-    
-    # Save model config
-    model_config = {
-        "model_type": "late_fusion_distilbert",
-        "text_dim": model.text_dim,
-        "metadata_dim": 10,
-        "num_labels": 2
-    }
     with open(os.path.join(model_dir, "config.json"), "w") as f:
-        json.dump(model_config, f, indent=2)
+        json.dump({
+            "model_type": "distilbert-late-fusion",
+            "num_labels": 2,
+            "metadata_size": config.get("metadata_size", 22)
+        }, f, indent=2)
     
     tokenizer.save_pretrained(tokenizer_dir)
     
@@ -225,9 +234,8 @@ def finalize_archive(model, tokenizer, test_dataset, training_args, eval_results
     # Save metadata format and config
     with open(os.path.join(metadata_dir, "metadata_config.json"), "w") as f:
         json.dump({
-            "fusion_type": config.get("fusion_technique", "late_fusion"),
-            "metadata_fields": config.get("metadata", {}),
-            "metadata_encoding": "numerical_features"
+            "fusion_type": config.get("fusion_technique", "unknown"),
+            "metadata_fields": config.get("metadata", {})
         }, f, indent=2)
     
     # Save sample test data (100 samples or less)
@@ -237,8 +245,7 @@ def finalize_archive(model, tokenizer, test_dataset, training_args, eval_results
         sample_data.append({
             "text": test_dataset.reviews[i] if hasattr(test_dataset, "reviews") else "",
             "label": int(test_dataset.labels[i]),
-            "metadata": test_dataset.metadata[i] if hasattr(test_dataset, "metadata") else {},
-            "metadata_features": test_dataset._encode_metadata(test_dataset.metadata[i]).tolist()
+            "metadata": test_dataset.metadata[i] if hasattr(test_dataset, "metadata") else {}
         })
     
     with open(os.path.join(metadata_dir, "test_samples.json"), "w") as f:
@@ -259,14 +266,24 @@ def finalize_archive(model, tokenizer, test_dataset, training_args, eval_results
     
     with torch.no_grad():
         for batch in test_loader:
-            inputs = {k: v.to(device) for k, v in batch.items() if k != 'labels'}
-            labels = batch["labels"]
+            inputs = {
+                'input_ids': batch['input_ids'].to(device),
+                'attention_mask': batch['attention_mask'].to(device),
+                'metadata_features': batch['metadata_features'].to(device)
+            }
+            labels = batch["label"]
             
             outputs = model(**inputs)
-            preds = torch.argmax(outputs.logits, dim=-1)
+            
+            if isinstance(outputs, tuple):
+                logits = outputs[1]
+            else:
+                logits = outputs
+                
+            preds = torch.argmax(logits, dim=-1)
             
             all_preds.append(preds.cpu().numpy())
-            all_logits.append(outputs.logits.cpu().numpy())
+            all_logits.append(logits.cpu().numpy())
             all_labels.append(labels.numpy())
     
     all_preds = np.concatenate(all_preds)
@@ -464,6 +481,15 @@ def main():
     # Create archive directory at the beginning
     archive_dir = create_archive_directory()
     
+    # Get common genres first
+    print("Extracting common genres from the database...")
+    common_genres = get_all_genres_from_database()
+    
+    # Save the determined genres to the archive
+    os.makedirs(os.path.join(archive_dir, "metadata"), exist_ok=True)
+    with open(os.path.join(archive_dir, "metadata", "common_genres.json"), "w") as f:
+        json.dump(common_genres, f, indent=2)
+    
     # Load data from database
     print("Loading data from database...")
     train_reviews, train_labels, train_metadata, test_reviews, test_labels, test_metadata = load_data_from_database()
@@ -476,13 +502,12 @@ def main():
     # Load tokenizer
     tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
     
-    # Create late fusion model
-    print("Creating late fusion model...")
-    model = LateFusionDistilBertModel(
-        model_name='distilbert-base-uncased',
-        num_labels=2,
-        metadata_dim=10
-    )
+    # Calculate metadata size: 2 base features (rating, votes) + genres
+    metadata_size = 2 + len(common_genres)
+    
+    # Create custom model for late fusion
+    model = DistilBertLateFusion(num_labels=2, metadata_size=metadata_size)
+    print(f"Created model with metadata size: {metadata_size} (2 base features + {len(common_genres)} genres)")
     
     # Create datasets
     print("Creating datasets...")
@@ -491,7 +516,8 @@ def main():
         train_labels, 
         train_metadata, 
         tokenizer, 
-        MAX_LENGTH
+        MAX_LENGTH,
+        common_genres
     )
     
     test_dataset = IMDBLateFusionDataset(
@@ -499,13 +525,14 @@ def main():
         test_labels, 
         test_metadata, 
         tokenizer, 
-        MAX_LENGTH
+        MAX_LENGTH,
+        common_genres
     )
     
     print(f"Training dataset size: {len(train_dataset)}")
     print(f"Testing dataset size: {len(test_dataset)}")
     
-    # Training arguments - SAME AS EARLY FUSION
+    # Training arguments - using archive directory paths
     training_args = TrainingArguments(
         output_dir=os.path.join(archive_dir, "training_outputs"),
         num_train_epochs=3,
@@ -521,7 +548,7 @@ def main():
         dataloader_pin_memory=True  # Enable pin memory for GPU
     )
     
-    # Create custom trainer
+    # Create custom trainer for late fusion
     trainer = LateFusionTrainer(
         model=model,
         args=training_args,
@@ -550,19 +577,15 @@ def main():
         "fusion_technique": "late_fusion",
         "metadata": {
             "genres": True,
+            "genre_list": common_genres,
             "ratings": True,
             "votes": True
         },
         "model_name": "distilbert-base-uncased",
-        "fusion_architecture": {
-            "text_encoder": "distilbert-base-uncased",
-            "metadata_encoder": "2-layer MLP (64->32)",
-            "fusion_layer": "2-layer MLP (800->256->64)",
-            "classifier": "linear (64->2)"
-        },
         "epochs": 3,
         "batch_size": 16,
         "max_length": MAX_LENGTH,
+        "metadata_size": metadata_size,
         "experiment_date": datetime.now().strftime("%Y-%m-%d"),
         "experiment_time": datetime.now().strftime("%H:%M:%S"),
         "description": "IMDB sentiment analysis with metadata using late fusion technique"
