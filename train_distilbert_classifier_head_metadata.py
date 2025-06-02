@@ -16,7 +16,7 @@ from transformers import (
 )
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from datetime import datetime
-from collections import Counter, defaultdict
+from collections import Counter
 
 # Constants
 DB_PATH = "imdb_reviews.db"
@@ -50,50 +50,14 @@ def get_all_genres_from_database():
     
     return top_genres
 
-def calculate_genre_sentiment_stats(reviews, labels, metadata, common_genres):
-    """Calculate genre-specific sentiment statistics from the training data"""
-    print("Calculating genre-specific sentiment statistics...")
-    
-    # Initialize counters
-    genre_pos_counts = defaultdict(int)
-    genre_total_counts = defaultdict(int)
-    
-    # Count occurrences
-    for i, meta in enumerate(metadata):
-        if meta.get('genres'):
-            label = labels[i]
-            for genre in meta['genres']:
-                if genre in common_genres:
-                    genre_total_counts[genre] += 1
-                    if label == 1:  # Positive sentiment
-                        genre_pos_counts[genre] += 1
-    
-    # Calculate positive ratios for each genre
-    genre_sentiment_stats = {}
-    for genre in common_genres:
-        total = genre_total_counts.get(genre, 0)
-        if total > 0:
-            pos_ratio = genre_pos_counts.get(genre, 0) / total
-        else:
-            pos_ratio = 0.5  # Default for no data
-        genre_sentiment_stats[genre] = pos_ratio
-    
-    # Print statistics
-    print("Genre sentiment statistics:")
-    for genre, ratio in sorted(genre_sentiment_stats.items(), key=lambda x: x[1]):
-        print(f"  {genre:15s}: {ratio:.3f} ({genre_pos_counts.get(genre, 0)}/{genre_total_counts.get(genre, 0)} positive)")
-    
-    return genre_sentiment_stats
-
 class IMDBIntegratedDataset(Dataset):
-    def __init__(self, reviews, labels, metadata, tokenizer, max_length, common_genres, genre_sentiment_stats=None):
+    def __init__(self, reviews, labels, metadata, tokenizer, max_length, common_genres):
         self.reviews = reviews
         self.labels = labels
         self.metadata = metadata
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.common_genres = common_genres
-        self.genre_sentiment_stats = genre_sentiment_stats or {}
         
     def __len__(self):
         return len(self.reviews)
@@ -130,21 +94,16 @@ class IMDBIntegratedDataset(Dataset):
             log_votes = 0.0
         metadata_features.append(log_votes)
         
-        # Create genre features with sentiment information
-        movie_genres = self.metadata[idx].get('genres', [])
+        # Create one-hot encoding for genres
+        genre_features = [0] * len(self.common_genres)
         
-        # For each genre, add both presence and sentiment statistics
-        for genre in self.common_genres:
-            # Genre presence (one-hot)
-            is_present = 1 if genre in movie_genres else 0
-            metadata_features.append(is_present)
+        if self.metadata[idx].get('genres'):
+            for i, genre in enumerate(self.common_genres):
+                if genre in self.metadata[idx]['genres']:
+                    genre_features[i] = 1
             
-            # Add genre sentiment statistics if available
-            if is_present and genre in self.genre_sentiment_stats:
-                genre_sent_ratio = self.genre_sentiment_stats[genre]
-            else:
-                genre_sent_ratio = 0.5  # Neutral for absent genres
-            metadata_features.append(genre_sent_ratio)
+        # Add all genre features to metadata_features
+        metadata_features.extend(genre_features)
         
         return {
             'input_ids': text_encoding['input_ids'].flatten(),
@@ -243,7 +202,7 @@ def create_archive_directory(base_dir="./training/distilbert-update-classifier-h
     print(f"Created archive directory: {archive_dir}")
     return archive_dir
 
-def finalize_archive(model, tokenizer, test_dataset, training_args, eval_results, config, archive_dir, genre_sentiment_stats=None):
+def finalize_archive(model, tokenizer, test_dataset, training_args, eval_results, config, archive_dir):
     """Finalize the archive with evaluation results and model artifacts"""
     print(f"Finalizing experiment archive in {archive_dir}...")
     
@@ -271,14 +230,8 @@ def finalize_archive(model, tokenizer, test_dataset, training_args, eval_results
     with open(os.path.join(metadata_dir, "metadata_config.json"), "w") as f:
         json.dump({
             "fusion_technique": config.get("fusion_technique", "updated_classifier_head"),
-            "metadata_fields": config.get("metadata", {}),
-            "genre_sentiment_embedding": True
+            "metadata_fields": config.get("metadata", {})
         }, f, indent=2)
-    
-    # Save genre sentiment statistics if available
-    if genre_sentiment_stats:
-        with open(os.path.join(metadata_dir, "genre_sentiment_stats.json"), "w") as f:
-            json.dump(genre_sentiment_stats, f, indent=2)
     
     # Save sample test data
     sample_size = min(100, len(test_dataset))
@@ -407,7 +360,6 @@ def finalize_archive(model, tokenizer, test_dataset, training_args, eval_results
         "model": config.get("model_name", "distilbert-base-uncased"),
         "fusion_technique": config.get("fusion_technique", "update classifier head with metadata"),
         "metadata_fields": config.get("metadata", {}),
-        "genre_sentiment_embedding": True,
         "accuracy": eval_results.get("eval_accuracy", 0) * 100,
         "f1_score": eval_results.get("eval_f1", 0) * 100,
         "parameter_count": int(total_params),
@@ -541,25 +493,15 @@ def main():
     train_reviews = [clean_text(review) for review in train_reviews]
     test_reviews = [clean_text(review) for review in test_reviews]
     
-    # Calculate genre sentiment statistics
-    print("Calculating genre sentiment statistics...")
-    genre_sentiment_stats = calculate_genre_sentiment_stats(
-        train_reviews, train_labels, train_metadata, common_genres
-    )
-    
-    # Save genre sentiment statistics to the archive
-    with open(os.path.join(archive_dir, "metadata", "genre_sentiment_stats.json"), "w") as f:
-        json.dump(genre_sentiment_stats, f, indent=2)
-    
     # Load tokenizer
     tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
     
-    # Calculate metadata size: 2 base features (rating, votes) + 2*genres (presence + sentiment for each)
-    metadata_size = 2 + (len(common_genres) * 2)
+    # Calculate metadata size: 2 base features (rating, votes) + genres
+    metadata_size = 2 + len(common_genres)
     
     # Create custom model for integrated metadata fusion
     model = DistilBertIntegratedMetadata(num_labels=2, metadata_size=metadata_size)
-    print(f"Created integrated metadata model with size: {metadata_size} (2 base features + {len(common_genres)*2} genre features)")
+    print(f"Created integrated metadata model with size: {metadata_size} (2 base features + {len(common_genres)} genres)")
     
     # Create datasets
     print("Creating datasets...")
@@ -569,8 +511,7 @@ def main():
         train_metadata, 
         tokenizer, 
         MAX_LENGTH,
-        common_genres,
-        genre_sentiment_stats
+        common_genres
     )
     
     test_dataset = IMDBIntegratedDataset(
@@ -579,8 +520,7 @@ def main():
         test_metadata, 
         tokenizer, 
         MAX_LENGTH,
-        common_genres,
-        genre_sentiment_stats
+        common_genres
     )
     
     print(f"Training dataset size: {len(train_dataset)}")
@@ -632,7 +572,6 @@ def main():
         "metadata": {
             "genres": True,
             "genre_list": common_genres,
-            "genre_sentiment_stats": True,
             "ratings": True,
             "votes": True
         },
@@ -643,7 +582,7 @@ def main():
         "metadata_size": metadata_size,
         "experiment_date": datetime.now().strftime("%Y-%m-%d"),
         "experiment_time": datetime.now().strftime("%H:%M:%S"),
-        "description": "IMDB sentiment analysis with genre sentiment embeddings integrated into classifier"
+        "description": "IMDB sentiment analysis with metadata integrated into classifier"
     }
     
     # Finalize archive with evaluation results and predictions
@@ -654,8 +593,7 @@ def main():
         training_args=training_args,
         eval_results=eval_results,
         config=config,
-        archive_dir=archive_dir,
-        genre_sentiment_stats=genre_sentiment_stats
+        archive_dir=archive_dir
     )
     
     print(f"Complete experiment archive created at {archive_dir}")
