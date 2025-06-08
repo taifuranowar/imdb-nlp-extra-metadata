@@ -8,9 +8,9 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
 from transformers import (
-    DistilBertModel,
-    DistilBertTokenizer,
-    DistilBertConfig,
+    RobertaModel,
+    RobertaTokenizer,
+    RobertaConfig,
     TrainingArguments, 
     Trainer
 )
@@ -155,33 +155,33 @@ class IMDBLateFusionDataset(Dataset):
             'label': torch.tensor(label, dtype=torch.long)
         }
 
-class DistilBertLateFusion(nn.Module):
+class RobertaLateFusion(nn.Module):
     def __init__(self, num_labels=2, metadata_size=22):  # Default is 2 base features + 20 genres
         super().__init__()
-        # Load DistilBERT for text processing
-        self.config = DistilBertConfig.from_pretrained('distilbert-base-uncased')
-        self.distilbert = DistilBertModel.from_pretrained('distilbert-base-uncased')
+        # Load RoBERTa for text processing
+        self.config = RobertaConfig.from_pretrained('roberta-base')
+        self.roberta = RobertaModel.from_pretrained('roberta-base')
         
         # Metadata processing
         self.metadata_encoder = nn.Sequential(
             nn.Linear(metadata_size, 64),
-            nn.ReLU(),
-            nn.Dropout(0.1),
+            nn.GELU(),  # RoBERTa uses GELU instead of ReLU
+            nn.Dropout(0.1),  # RoBERTa's default dropout is 0.1
             nn.Linear(64, 64),
-            nn.ReLU()
+            nn.GELU()
         )
         
         # Late fusion layer
-        self.fusion_layer = nn.Linear(self.config.dim + 64, self.config.dim)
+        self.fusion_layer = nn.Linear(self.config.hidden_size + 64, self.config.hidden_size)
         
         # Classification head
-        self.pre_classifier = nn.Linear(self.config.dim, self.config.dim)
-        self.dropout = nn.Dropout(0.2)
-        self.classifier = nn.Linear(self.config.dim, num_labels)
+        self.pre_classifier = nn.Linear(self.config.hidden_size, self.config.hidden_size)
+        self.dropout = nn.Dropout(0.1)  # RoBERTa's default dropout is 0.1
+        self.classifier = nn.Linear(self.config.hidden_size, num_labels)
         
     def forward(self, input_ids, attention_mask, metadata_features, labels=None):
-        # Process text through DistilBERT
-        outputs = self.distilbert(input_ids=input_ids, attention_mask=attention_mask)
+        # Process text through RoBERTa
+        outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
         hidden_state = outputs.last_hidden_state[:, 0]  # Use CLS token
         
         # Process metadata features
@@ -193,7 +193,7 @@ class DistilBertLateFusion(nn.Module):
         
         # Classification
         pooled_output = self.pre_classifier(fused)
-        pooled_output = nn.ReLU()(pooled_output)
+        pooled_output = nn.GELU()(pooled_output)  # RoBERTa uses GELU
         pooled_output = self.dropout(pooled_output)
         logits = self.classifier(pooled_output)
         
@@ -227,7 +227,7 @@ class LateFusionTrainer(Trainer):
             
         return (loss, {"logits": logits}) if return_outputs else loss
 
-def create_archive_directory(base_dir="./training/distilbert-late-fusion-imdb-archive"):
+def create_archive_directory(base_dir="./training/roberta-late-fusion-imdb-archive"):
     """Create timestamped archive directory at the beginning of the experiment"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     archive_dir = f"{base_dir}_{timestamp}"
@@ -260,7 +260,7 @@ def finalize_archive(model, tokenizer, test_dataset, training_args, eval_results
     torch.save(model.state_dict(), os.path.join(model_dir, "pytorch_model.bin"))
     with open(os.path.join(model_dir, "config.json"), "w") as f:
         json.dump({
-            "model_type": "distilbert-late-fusion",
+            "model_type": "roberta-late-fusion",
             "num_labels": 2,
             "metadata_size": config.get("metadata_size", 22)
         }, f, indent=2)
@@ -304,7 +304,7 @@ def finalize_archive(model, tokenizer, test_dataset, training_args, eval_results
     model.eval()
     
     # Create dataloader
-    test_loader = DataLoader(test_dataset, batch_size=16)
+    test_loader = DataLoader(test_dataset, batch_size=8)  # Smaller batch size for RoBERTa
     
     all_preds = []
     all_logits = []
@@ -408,7 +408,7 @@ def finalize_archive(model, tokenizer, test_dataset, training_args, eval_results
     summary = {
         "experiment_id": os.path.basename(archive_dir),
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "model": config.get("model_name", "distilbert-base-uncased"),
+        "model": config.get("model_name", "roberta-base"),
         "fusion_technique": config.get("fusion_technique", "late_fusion"),
         "metadata_fields": config.get("metadata", {}),
         "genre_sentiment_embedding": True,
@@ -556,13 +556,13 @@ def main():
         json.dump(genre_sentiment_stats, f, indent=2)
     
     # Load tokenizer
-    tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
+    tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
     
     # Calculate metadata size: 2 base features (rating, votes) + 2*genres (presence + sentiment)
     metadata_size = 2 + (len(common_genres) * 2)
     
     # Create custom model for late fusion
-    model = DistilBertLateFusion(num_labels=2, metadata_size=metadata_size)
+    model = RobertaLateFusion(num_labels=2, metadata_size=metadata_size)
     print(f"Created model with metadata size: {metadata_size} (2 base features + {len(common_genres)*2} genre features)")
     
     # Create datasets
@@ -591,11 +591,13 @@ def main():
     print(f"Testing dataset size: {len(test_dataset)}")
     
     # Training arguments - using archive directory paths
+    # RoBERTa is larger than DistilBERT, so we need to adjust batch sizes
     training_args = TrainingArguments(
         output_dir=os.path.join(archive_dir, "training_outputs"),
         num_train_epochs=3,
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=16,
+        per_device_train_batch_size=8,  # Reduced for RoBERTa
+        per_device_eval_batch_size=8,   # Reduced for RoBERTa
+        gradient_accumulation_steps=2,  # Add gradient accumulation
         weight_decay=0.01,
         logging_dir=os.path.join(archive_dir, "logs"),
         logging_steps=500,
@@ -603,7 +605,8 @@ def main():
         eval_steps=1500,
         do_eval=True,
         no_cuda=False,  # Set to False to use GPU
-        dataloader_pin_memory=True  # Enable pin memory for GPU
+        dataloader_pin_memory=True,  # Enable pin memory for GPU
+        fp16=True  # Enable mixed precision training
     )
     
     # Create custom trainer for late fusion
@@ -640,14 +643,15 @@ def main():
             "ratings": True,
             "votes": True
         },
-        "model_name": "distilbert-base-uncased",
+        "model_name": "roberta-base",
         "epochs": 3,
-        "batch_size": 16,
+        "batch_size": 8,
+        "gradient_accumulation_steps": 2,
         "max_length": MAX_LENGTH,
         "metadata_size": metadata_size,
         "experiment_date": datetime.now().strftime("%Y-%m-%d"),
         "experiment_time": datetime.now().strftime("%H:%M:%S"),
-        "description": "IMDB sentiment analysis with metadata using late fusion technique with genre sentiment embeddings"
+        "description": "IMDB sentiment analysis with metadata using RoBERTa with late fusion technique and genre sentiment embeddings"
     }
     
     # Finalize archive with evaluation results and predictions

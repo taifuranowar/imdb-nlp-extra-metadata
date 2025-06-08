@@ -6,11 +6,12 @@ import numpy as np
 import time
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
 from transformers import (
-    DistilBertModel,
-    DistilBertTokenizer,
-    DistilBertConfig,
+    RobertaModel,
+    RobertaTokenizer,
+    RobertaConfig,
     TrainingArguments, 
     Trainer
 )
@@ -85,11 +86,11 @@ def calculate_genre_sentiment_stats(reviews, labels, metadata, common_genres):
     
     return genre_sentiment_stats
 
-class IMDBLateFusionDataset(Dataset):
+class IMDBCrossAttentionDataset(Dataset):
     def __init__(self, reviews, labels, metadata, tokenizer, max_length, common_genres, genre_sentiment_stats=None):
         self.reviews = reviews
         self.labels = labels
-        self.metadata = metadata  # Dictionary with genres and ratings
+        self.metadata = metadata
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.common_genres = common_genres
@@ -102,7 +103,7 @@ class IMDBLateFusionDataset(Dataset):
         review = self.reviews[idx]
         label = self.labels[idx]
         
-        # Process review text separately
+        # Process review text
         text_encoding = self.tokenizer(
             review,
             truncation=True,
@@ -112,13 +113,12 @@ class IMDBLateFusionDataset(Dataset):
         )
         
         # Process metadata as separate features
-        # Create feature vector for metadata
         metadata_features = []
         
         # Add rating (normalized)
         rating = self.metadata[idx].get('rating', 0)
         if rating:
-            normalized_rating = float(rating) / 10.0  # Assuming rating is out of 10
+            normalized_rating = float(rating) / 10.0
         else:
             normalized_rating = 0.0
         metadata_features.append(normalized_rating)
@@ -126,8 +126,7 @@ class IMDBLateFusionDataset(Dataset):
         # Add vote count (log-normalized)
         votes = self.metadata[idx].get('votes', 0)
         if votes:
-            # Log normalization to handle wide range of vote counts
-            log_votes = np.log1p(float(votes)) / 15.0  # Normalized by log(1M)
+            log_votes = np.log1p(float(votes)) / 15.0
         else:
             log_votes = 0.0
         metadata_features.append(log_votes)
@@ -141,7 +140,7 @@ class IMDBLateFusionDataset(Dataset):
             is_present = 1 if genre in movie_genres else 0
             metadata_features.append(is_present)
             
-            # Add genre sentiment statistics if available
+            # Genre sentiment statistics
             if is_present and genre in self.genre_sentiment_stats:
                 genre_sent_ratio = self.genre_sentiment_stats[genre]
             else:
@@ -152,61 +151,123 @@ class IMDBLateFusionDataset(Dataset):
             'input_ids': text_encoding['input_ids'].flatten(),
             'attention_mask': text_encoding['attention_mask'].flatten(),
             'metadata_features': torch.tensor(metadata_features, dtype=torch.float),
-            'label': torch.tensor(label, dtype=torch.long)
+            'labels': torch.tensor(label, dtype=torch.long)
         }
 
-class DistilBertLateFusion(nn.Module):
-    def __init__(self, num_labels=2, metadata_size=22):  # Default is 2 base features + 20 genres
+class CrossAttentionLayer(nn.Module):
+    def __init__(self, hidden_dim, metadata_dim, num_heads=4):
         super().__init__()
-        # Load DistilBERT for text processing
-        self.config = DistilBertConfig.from_pretrained('distilbert-base-uncased')
-        self.distilbert = DistilBertModel.from_pretrained('distilbert-base-uncased')
+        self.hidden_dim = hidden_dim
+        self.metadata_dim = metadata_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
         
-        # Metadata processing
-        self.metadata_encoder = nn.Sequential(
-            nn.Linear(metadata_size, 64),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(64, 64),
-            nn.ReLU()
+        # Project metadata to the same dimension as text
+        self.metadata_projector = nn.Linear(metadata_dim, hidden_dim)
+        
+        # Query, Key, Value projections
+        self.q_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.k_proj = nn.Linear(hidden_dim, hidden_dim)
+        self.v_proj = nn.Linear(hidden_dim, hidden_dim)
+        
+        # Output projection
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        
+        # Layer normalization
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        
+        # Feed-forward network
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim * 4),
+            nn.GELU(),  # RoBERTa uses GELU activation
+            nn.Linear(hidden_dim * 4, hidden_dim)
         )
         
-        # Late fusion layer
-        self.fusion_layer = nn.Linear(self.config.dim + 64, self.config.dim)
+        # Dropout
+        self.dropout = nn.Dropout(0.1)  # RoBERTa's default dropout
+        
+    def forward(self, text_hidden_states, metadata_features):
+        batch_size = text_hidden_states.size(0)
+        
+        # Get CLS token representation (for classification)
+        # For RoBERTa, the first token is also the CLS token like BERT
+        cls_hidden = text_hidden_states[:, 0]
+        
+        # Project metadata to hidden dimension
+        metadata_proj = self.metadata_projector(metadata_features).unsqueeze(1)  # [B, 1, H]
+        
+        # Cross-attention
+        # Text as query, metadata as key/value
+        q = self.q_proj(cls_hidden).view(batch_size, self.num_heads, self.head_dim).unsqueeze(2)
+        k = self.k_proj(metadata_proj).view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(metadata_proj).view(batch_size, 1, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Compute attention scores
+        attn_scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        attn_probs = F.softmax(attn_scores, dim=-1)
+        attn_probs = self.dropout(attn_probs)
+        
+        # Apply attention to values
+        attn_output = torch.matmul(attn_probs, v)  # [B, heads, 1, head_dim]
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, 1, self.hidden_dim)
+        attn_output = self.out_proj(attn_output).squeeze(1)  # [B, H]
+        
+        # First residual connection and layer norm
+        enhanced_cls = self.norm1(cls_hidden + attn_output)
+        
+        # Feed-forward network
+        ffn_output = self.ffn(enhanced_cls)
+        
+        # Second residual connection and layer norm
+        enhanced_cls = self.norm2(enhanced_cls + ffn_output)
+        
+        return enhanced_cls
+
+class RobertaCrossAttention(nn.Module):
+    def __init__(self, num_labels=2, metadata_size=22):
+        super().__init__()
+        
+        # Load RoBERTa for text processing
+        self.config = RobertaConfig.from_pretrained('roberta-base')
+        self.roberta = RobertaModel.from_pretrained('roberta-base')
+        
+        # Cross-attention mechanism for text and metadata
+        self.cross_attention = CrossAttentionLayer(
+            hidden_dim=self.config.hidden_size,  # RoBERTa uses hidden_size
+            metadata_dim=metadata_size,  # Metadata feature dimension
+            num_heads=4  # Number of attention heads
+        )
         
         # Classification head
-        self.pre_classifier = nn.Linear(self.config.dim, self.config.dim)
-        self.dropout = nn.Dropout(0.2)
-        self.classifier = nn.Linear(self.config.dim, num_labels)
+        self.classifier = nn.Sequential(
+            nn.Linear(self.config.hidden_size, self.config.hidden_size),
+            nn.GELU(),  # RoBERTa uses GELU activation
+            nn.Dropout(0.1),  # RoBERTa's default dropout
+            nn.Linear(self.config.hidden_size, num_labels)
+        )
         
     def forward(self, input_ids, attention_mask, metadata_features, labels=None):
-        # Process text through DistilBERT
-        outputs = self.distilbert(input_ids=input_ids, attention_mask=attention_mask)
-        hidden_state = outputs.last_hidden_state[:, 0]  # Use CLS token
+        # Process text through RoBERTa
+        outputs = self.roberta(input_ids=input_ids, attention_mask=attention_mask)
+        hidden_states = outputs.last_hidden_state  # [B, seq_len, hidden_dim]
         
-        # Process metadata features
-        metadata_encoded = self.metadata_encoder(metadata_features)
-        
-        # Late fusion by concatenation and projection
-        combined = torch.cat([hidden_state, metadata_encoded], dim=1)
-        fused = self.fusion_layer(combined)
+        # Apply cross-attention between text and metadata
+        enhanced_representation = self.cross_attention(hidden_states, metadata_features)
         
         # Classification
-        pooled_output = self.pre_classifier(fused)
-        pooled_output = nn.ReLU()(pooled_output)
-        pooled_output = self.dropout(pooled_output)
-        logits = self.classifier(pooled_output)
+        logits = self.classifier(enhanced_representation)
         
         loss = None
         if labels is not None:
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(logits.view(-1, 2), labels.view(-1))
             
-        return torch.nn.functional.log_softmax(logits, dim=1) if loss is None else (loss, logits)
+        return (loss, logits) if loss is not None else logits
 
-class LateFusionTrainer(Trainer):
+class CrossAttentionTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        # Check if 'label' or 'labels' is in the inputs
+        # Extract labels (expected to be "labels" from our dataset)
         if 'label' in inputs:
             labels = inputs.pop("label")
         elif 'labels' in inputs:
@@ -227,7 +288,7 @@ class LateFusionTrainer(Trainer):
             
         return (loss, {"logits": logits}) if return_outputs else loss
 
-def create_archive_directory(base_dir="./training/distilbert-late-fusion-imdb-archive"):
+def create_archive_directory(base_dir="./training/roberta-cross-attention-imdb-archive"):
     """Create timestamped archive directory at the beginning of the experiment"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     archive_dir = f"{base_dir}_{timestamp}"
@@ -260,9 +321,10 @@ def finalize_archive(model, tokenizer, test_dataset, training_args, eval_results
     torch.save(model.state_dict(), os.path.join(model_dir, "pytorch_model.bin"))
     with open(os.path.join(model_dir, "config.json"), "w") as f:
         json.dump({
-            "model_type": "distilbert-late-fusion",
+            "model_type": "roberta-cross-attention",
             "num_labels": 2,
-            "metadata_size": config.get("metadata_size", 22)
+            "metadata_size": config.get("metadata_size", 22),
+            "num_attention_heads": 4
         }, f, indent=2)
     
     tokenizer.save_pretrained(tokenizer_dir)
@@ -274,9 +336,8 @@ def finalize_archive(model, tokenizer, test_dataset, training_args, eval_results
     # Save metadata format and config
     with open(os.path.join(metadata_dir, "metadata_config.json"), "w") as f:
         json.dump({
-            "fusion_type": config.get("fusion_technique", "unknown"),
-            "metadata_fields": config.get("metadata", {}),
-            "genre_sentiment_embedding": True
+            "fusion_technique": config.get("fusion_technique", "cross_attention"),
+            "metadata_fields": config.get("metadata", {})
         }, f, indent=2)
     
     # Save genre sentiment statistics if available
@@ -284,7 +345,7 @@ def finalize_archive(model, tokenizer, test_dataset, training_args, eval_results
         with open(os.path.join(metadata_dir, "genre_sentiment_stats.json"), "w") as f:
             json.dump(genre_sentiment_stats, f, indent=2)
     
-    # Save sample test data (100 samples or less)
+    # Save sample test data
     sample_size = min(100, len(test_dataset))
     sample_data = []
     for i in range(sample_size):
@@ -304,7 +365,7 @@ def finalize_archive(model, tokenizer, test_dataset, training_args, eval_results
     model.eval()
     
     # Create dataloader
-    test_loader = DataLoader(test_dataset, batch_size=16)
+    test_loader = DataLoader(test_dataset, batch_size=8)  # Smaller batch size for RoBERTa
     
     all_preds = []
     all_logits = []
@@ -317,7 +378,7 @@ def finalize_archive(model, tokenizer, test_dataset, training_args, eval_results
                 'attention_mask': batch['attention_mask'].to(device),
                 'metadata_features': batch['metadata_features'].to(device)
             }
-            labels = batch["label"]
+            labels = batch["labels"]  # Note: Using "labels" key here
             
             outputs = model(**inputs)
             
@@ -408,8 +469,8 @@ def finalize_archive(model, tokenizer, test_dataset, training_args, eval_results
     summary = {
         "experiment_id": os.path.basename(archive_dir),
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "model": config.get("model_name", "distilbert-base-uncased"),
-        "fusion_technique": config.get("fusion_technique", "late_fusion"),
+        "model": config.get("model_name", "roberta-base"),
+        "fusion_technique": config.get("fusion_technique", "cross_attention"),
         "metadata_fields": config.get("metadata", {}),
         "genre_sentiment_embedding": True,
         "accuracy": eval_results.get("eval_accuracy", 0) * 100,
@@ -523,7 +584,6 @@ def main():
         print(f"CUDA is available! Using GPU: {torch.cuda.get_device_name(0)}")
     else:
         print("CUDA is not available. Training will be on CPU, which will be much slower.")
-        print("If you have a GPU, make sure CUDA drivers are properly installed.")
     
     # Create archive directory at the beginning
     archive_dir = create_archive_directory()
@@ -546,7 +606,7 @@ def main():
     train_reviews = [clean_text(review) for review in train_reviews]
     test_reviews = [clean_text(review) for review in test_reviews]
     
-    # Calculate genre sentiment statistics
+    # Calculate genre sentiment statistics from training data
     genre_sentiment_stats = calculate_genre_sentiment_stats(
         train_reviews, train_labels, train_metadata, common_genres
     )
@@ -556,18 +616,19 @@ def main():
         json.dump(genre_sentiment_stats, f, indent=2)
     
     # Load tokenizer
-    tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
+    tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
     
-    # Calculate metadata size: 2 base features (rating, votes) + 2*genres (presence + sentiment)
+    # Calculate metadata size: 
+    # 2 base features (rating, votes) + 2*genres (presence + sentiment stat for each genre)
     metadata_size = 2 + (len(common_genres) * 2)
     
-    # Create custom model for late fusion
-    model = DistilBertLateFusion(num_labels=2, metadata_size=metadata_size)
-    print(f"Created model with metadata size: {metadata_size} (2 base features + {len(common_genres)*2} genre features)")
+    # Create custom model with cross-attention
+    model = RobertaCrossAttention(num_labels=2, metadata_size=metadata_size)
+    print(f"Created cross-attention model with metadata size: {metadata_size} (2 base features + {len(common_genres)*2} genre features)")
     
     # Create datasets
     print("Creating datasets...")
-    train_dataset = IMDBLateFusionDataset(
+    train_dataset = IMDBCrossAttentionDataset(
         train_reviews, 
         train_labels, 
         train_metadata, 
@@ -577,7 +638,7 @@ def main():
         genre_sentiment_stats
     )
     
-    test_dataset = IMDBLateFusionDataset(
+    test_dataset = IMDBCrossAttentionDataset(
         test_reviews, 
         test_labels, 
         test_metadata, 
@@ -591,11 +652,13 @@ def main():
     print(f"Testing dataset size: {len(test_dataset)}")
     
     # Training arguments - using archive directory paths
+    # RoBERTa is larger than DistilBERT, so we need to adjust batch sizes and add optimization techniques
     training_args = TrainingArguments(
         output_dir=os.path.join(archive_dir, "training_outputs"),
         num_train_epochs=3,
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=16,
+        per_device_train_batch_size=8,  # Smaller for RoBERTa
+        per_device_eval_batch_size=8,   # Smaller for RoBERTa
+        gradient_accumulation_steps=2,  # Accumulate gradients to compensate for smaller batch
         weight_decay=0.01,
         logging_dir=os.path.join(archive_dir, "logs"),
         logging_steps=500,
@@ -603,11 +666,12 @@ def main():
         eval_steps=1500,
         do_eval=True,
         no_cuda=False,  # Set to False to use GPU
-        dataloader_pin_memory=True  # Enable pin memory for GPU
+        dataloader_pin_memory=True,  # Enable pin memory for GPU
+        fp16=True  # Enable mixed precision training
     )
     
-    # Create custom trainer for late fusion
-    trainer = LateFusionTrainer(
+    # Create custom trainer
+    trainer = CrossAttentionTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
@@ -630,9 +694,9 @@ def main():
     print(f"Recall: {eval_results['eval_recall'] * 100:.2f}%")
     print(f"F1 Score: {eval_results['eval_f1'] * 100:.2f}%")
     
-    # Create comprehensive model archive - comprehensive configuration
+    # Create comprehensive model archive
     config = {
-        "fusion_technique": "late_fusion",
+        "fusion_technique": "cross_attention",
         "metadata": {
             "genres": True,
             "genre_list": common_genres,
@@ -640,14 +704,16 @@ def main():
             "ratings": True,
             "votes": True
         },
-        "model_name": "distilbert-base-uncased",
+        "model_name": "roberta-base",
         "epochs": 3,
-        "batch_size": 16,
+        "batch_size": 8,
+        "gradient_accumulation_steps": 2,
         "max_length": MAX_LENGTH,
         "metadata_size": metadata_size,
+        "num_attention_heads": 4,
         "experiment_date": datetime.now().strftime("%Y-%m-%d"),
         "experiment_time": datetime.now().strftime("%H:%M:%S"),
-        "description": "IMDB sentiment analysis with metadata using late fusion technique with genre sentiment embeddings"
+        "description": "IMDB sentiment analysis using cross-attention between RoBERTa text representations and metadata with genre sentiment embeddings"
     }
     
     # Finalize archive with evaluation results and predictions
