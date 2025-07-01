@@ -1,0 +1,10 @@
+numpy
+pandas
+matplotlib
+seaborn
+scikit-learn
+scipy
+statsmodels
+torch
+transformers
+sqlite3 ; included in Python stdlib, but listed for clarity

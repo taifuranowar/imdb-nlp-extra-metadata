@@ -6,7 +6,7 @@ import seaborn as sns
 from scipy.stats import gaussian_kde
 
 # Connect to SQLite Database/home/maira/imdb/imdb-nlp-extra-metadata/aclImdb/imdb_reviews.db
-db_path = "/home/maira/imdb/imdb-nlp-extra-metadata/imdb_reviews.db"
+db_path = "imdb_reviews.db"
 try:
     conn = sqlite3.connect(db_path)
     query = """

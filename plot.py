@@ -4,23 +4,18 @@ import matplotlib.pyplot as plt
 import numpy as np
 from typing import List, Dict, Tuple
 from datetime import datetime
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 
 def find_training_folders(base_dir="./training") -> List[str]:
-    """Find all folders in /training that contain experiment_summary.json files."""
     training_folders = []
-    
-    # Walk through all subdirectories in the /training folder
     print(f"Scanning {base_dir} for training experiments...")
     for root, dirs, files in os.walk(base_dir):
-        # Check if this directory contains an experiment_summary.json file
-        if "experiment_summary.json" in files:
-            # Store the full path to the folder
+        if "predictions.npy" in files and "labels.npy" in files:
             training_folders.append(root)
-    
     return sorted(training_folders)
 
 def load_experiment_summary(folder_path: str) -> Dict:
-    """Load the experiment summary JSON from a folder."""
+    # Only for display, not for metrics
     json_path = os.path.join(folder_path, "experiment_summary.json")
     try:
         with open(json_path, 'r') as f:
@@ -29,32 +24,53 @@ def load_experiment_summary(folder_path: str) -> Dict:
         return {"error": "Could not load experiment summary"}
 
 def display_training_folders(folders: List[str]) -> None:
-    """Display the list of training folders with their complete experiment summaries."""
     print("\nAvailable Training Experiments:")
     print("=" * 80)
-    
     for i, folder in enumerate(folders, 1):
-        summary = load_experiment_summary(folder)
-        print(f"{i}. {os.path.basename(folder)}")
-        
-        # Display the entire summary JSON content
-        print("   Summary Content:")
-        for key, value in summary.items():
-            # Format the output for readability
-            if isinstance(value, (int, float)) and key in ["accuracy", "f1_score"]:
-                print(f"   - {key}: {value:.2f}%")
-            else:
-                print(f"   - {key}: {value}")
+        # Show the parent folder name (experiment folder)
+        exp_folder = os.path.basename(os.path.dirname(folder)) if os.path.basename(folder) == "predictions" else os.path.basename(folder)
+        print(f"{i}. {exp_folder}")
+        summary_path = os.path.join(os.path.dirname(folder), "experiment_summary.json") if os.path.basename(folder) == "predictions" else os.path.join(folder, "experiment_summary.json")
+        metrics = {}
+        if os.path.exists(summary_path):
+            try:
+                with open(summary_path, "r") as f:
+                    summary = json.load(f)
+                for key in ["accuracy", "precision", "recall", "f1", "f1_score"]:
+                    if key in summary:
+                        metrics[key] = summary[key]
+            except Exception:
+                pass
+        # If metrics missing, compute from predictions
+        preds_path = os.path.join(folder, "predictions.npy")
+        labels_path = os.path.join(folder, "labels.npy")
+        if (not metrics or len(metrics) < 4) and os.path.exists(preds_path) and os.path.exists(labels_path):
+            try:
+                preds = np.load(preds_path)
+                labels = np.load(labels_path)
+                from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+                acc = accuracy_score(labels, preds)
+                precision, recall, f1, _ = precision_recall_fscore_support(labels, preds, average='weighted')
+                metrics = {
+                    "accuracy": acc,
+                    "precision": precision,
+                    "recall": recall,
+                    "f1": f1
+                }
+            except Exception:
+                pass
+        if metrics:
+            print("   - accuracy: {:.2f}%".format(metrics.get("accuracy", 0)*100 if metrics.get("accuracy", 0) < 1 else metrics.get("accuracy", 0)))
+            print("   - precision: {:.2f}%".format(metrics.get("precision", 0)*100 if metrics.get("precision", 0) < 1 else metrics.get("precision", 0)))
+            print("   - recall: {:.2f}%".format(metrics.get("recall", 0)*100 if metrics.get("recall", 0) < 1 else metrics.get("recall", 0)))
+            print("   - f1: {:.2f}%".format(metrics.get("f1", metrics.get("f1_score", 0))*100 if metrics.get("f1", metrics.get("f1_score", 0)) < 1 else metrics.get("f1", metrics.get("f1_score", 0))))
         print("-" * 80)
 
 def get_user_selections(folders: List[str]) -> List[int]:
-    """Get the user's selection of training folders by index."""
     while True:
         try:
             selection = input("\nSelect training folders by number (comma-separated, e.g., 1,3,4): ").strip()
             indices = [int(idx.strip()) for idx in selection.split(",") if idx.strip()]
-            
-            # Check if all indices are valid
             if all(1 <= idx <= len(folders) for idx in indices):
                 return indices
             else:
@@ -62,21 +78,10 @@ def get_user_selections(folders: List[str]) -> List[int]:
         except ValueError:
             print("Error: Please enter valid numbers separated by commas")
 
-def get_plot_parameters(selected_folders: List[str], indices: List[int]) -> Tuple[str, List[str], Tuple[float, float]]:
-    """Get the metric choice, custom labels, and y-axis range for the plot."""
-    # Choose metric
-    while True:
-        metric = input("\nChoose metric to plot (accuracy or f1): ").strip().lower()
-        if metric in ["accuracy", "f1"]:
-            break
-        print("Error: Please enter either 'accuracy' or 'f1'")
-    
-    metric_key = "accuracy" if metric == "accuracy" else "f1_score"
-    
+def get_plot_parameters(selected_folders: List[str], indices: List[int]) -> Tuple[List[str], Tuple[float, float]]:
     # Get y-axis range customization
     custom_range = input("\nWould you like to set a custom y-axis range? (y/n): ").strip().lower()
     y_min, y_max = None, None
-    
     if custom_range == 'y':
         while True:
             try:
@@ -84,123 +89,98 @@ def get_plot_parameters(selected_folders: List[str], indices: List[int]) -> Tupl
                 if '-' not in range_input:
                     print("Error: Please use format 'min-max' (e.g., 94.0-94.9)")
                     continue
-                    
                 parts = range_input.split('-')
                 y_min = float(parts[0].strip())
                 y_max = float(parts[1].strip())
-                
                 if y_min >= y_max:
                     print("Error: Min value must be less than max value")
                     continue
-                    
                 break
             except ValueError:
                 print("Error: Please enter valid numbers")
-    
     # Get custom labels for each selected training
     labels = []
     print("\nProvide custom labels for each training:")
     for i, folder_idx in enumerate(range(len(selected_folders))):
         folder = selected_folders[folder_idx]
         summary = load_experiment_summary(folder)
-        
         print(f"\nTraining {i+1}: {os.path.basename(folder)}")
-        
-        # Display the entire summary JSON content
         print("   Complete Summary Content:")
         for key, value in summary.items():
-            # Format the output for readability
             if isinstance(value, (int, float)) and key in ["accuracy", "f1_score"]:
                 print(f"   - {key}: {value:.2f}%")
             else:
                 print(f"   - {key}: {value}")
-        
         label = input(f"Label for this training (press Enter to use folder name): ").strip()
         if not label:
             label = os.path.basename(folder)
         labels.append(label)
-    
-    return metric_key, labels, (y_min, y_max)
+    return labels, (y_min, y_max)
 
-def create_plot(selected_folders: List[str], indices: List[int], metric: str, labels: List[str], y_range: Tuple[float, float] = (None, None)) -> None:
-    """Create and display the plot."""
-    # Extract the metric values
-    values = []
-    for i in range(len(selected_folders)):
-        folder = selected_folders[i]
-        summary = load_experiment_summary(folder)
-        values.append(summary.get(metric, 0))
-    
-    # Create the plot
-    plt.figure(figsize=(12, 6))
-    x = np.arange(len(labels))
-    bars = plt.bar(x, values, width=0.6, color='skyblue', edgecolor='navy')
-    
-    # Add labels and title
-    metric_name = "Accuracy" if metric == "accuracy" else "F1 Score"
-    plt.xlabel("Training Experiments", fontsize=12)
-    plt.ylabel(f"{metric_name} (%)", fontsize=12)
-    plt.title(f"{metric_name} Comparison of Selected Training Experiments", fontsize=14)
-    
-    # Set custom y-axis limits if provided
-    y_min, y_max = y_range
-    if y_min is not None and y_max is not None:
-        plt.ylim(y_min, y_max)
-        # Adjust the position of the value labels based on custom range
-        label_offset = (y_max - y_min) * 0.02
+def get_metrics_from_folder(folder: str) -> Dict[str, float]:
+    preds_path = os.path.join(folder, "predictions.npy")
+    labels_path = os.path.join(folder, "labels.npy")
+    if os.path.exists(preds_path) and os.path.exists(labels_path):
+        preds = np.load(preds_path)
+        y_true = np.load(labels_path)
+        acc = accuracy_score(y_true, preds) * 100
+        precision, recall, f1, _ = precision_recall_fscore_support(y_true, preds, average='weighted')
+        return {
+            "accuracy": acc,
+            "precision": precision * 100,
+            "recall": recall * 100,
+            "f1_score": f1 * 100
+        }
     else:
-        # Default offset
-        label_offset = 0.5
-    
-    # Add value labels on top of bars
-    for bar in bars:
-        height = bar.get_height()
-        plt.text(bar.get_x() + bar.get_width()/2., height + label_offset,
-                 f'{height:.2f}%', ha='center', va='bottom')
-    
-    # Add x-tick labels
-    plt.xticks(x, labels, rotation=45, ha="right")
+        return {
+            "accuracy": 0,
+            "precision": 0,
+            "recall": 0,
+            "f1_score": 0
+        }
+
+def create_multi_metric_plot(selected_folders: List[str], labels: List[str], y_range: Tuple[float, float] = (None, None)) -> None:
+    metrics = ["accuracy", "precision", "recall", "f1_score"]
+    metric_names = ["Accuracy", "Precision", "Recall", "F1 Score"]
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+    values = {metric: [] for metric in metrics}
+
+    # Get all metrics from .npy files, not from json
+    for folder in selected_folders:
+        folder_metrics = get_metrics_from_folder(folder)
+        for metric in metrics:
+            values[metric].append(folder_metrics[metric])
+
+    x = np.arange(len(labels))
+    fig, axs = plt.subplots(2, 2, figsize=(14, 8), sharex=True)
+    axs = axs.flatten()
+    y_min, y_max = y_range
+    for i, (metric, name, color) in enumerate(zip(metrics, metric_names, colors)):
+        axs[i].bar(x, values[metric], color=color, alpha=0.8)
+        axs[i].set_title(name, fontsize=14, fontweight='bold')
+        axs[i].set_ylim([y_min if y_min is not None else 91, y_max if y_max is not None else 100])
+        axs[i].set_ylabel("Score (%)")
+        axs[i].set_xticks(x)
+        axs[i].set_xticklabels(labels, rotation=25, ha='right', fontsize=10)
+        for xi, val in zip(x, values[metric]):
+            axs[i].text(xi, val + 0.1, f"{val:.1f}%", ha='center', va='bottom', fontsize=9)
     plt.tight_layout()
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
-    
-    # Create plots directory if it doesn't exist
-    plots_dir = "./plots"
-    os.makedirs(plots_dir, exist_ok=True)
-    
-    # Save plot to the plots folder
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    plot_filename = f"training_comparison_{metric_name.lower().replace(' ', '_')}_{timestamp}.png"
-    plot_path = os.path.join(plots_dir, plot_filename)
-    
-    plt.savefig(plot_path)
-    print(f"\nPlot saved to: {plot_path}")
-    
-    # Display plot
     plt.show()
 
 def main():
-    """Main function to orchestrate the workflow."""
     training_folders = find_training_folders()
-    
     if not training_folders:
         print("No valid training experiments found with experiment_summary.json files.")
         return
-    
     print(f"Found {len(training_folders)} training experiments.")
     display_training_folders(training_folders)
     selected_indices = get_user_selections(training_folders)
-    
     if not selected_indices:
         print("No valid selections. Exiting.")
         return
-    
-    # Create list of selected folder paths
     selected_folders = [training_folders[i-1] for i in selected_indices]
-    
-    # Pass the selected folders and their sequential indices (1, 2, 3, etc.)
-    metric, labels, y_range = get_plot_parameters(selected_folders, list(range(1, len(selected_folders) + 1)))
-    create_plot(selected_folders, list(range(1, len(selected_folders) + 1)), metric, labels, y_range)
-    
+    labels, y_range = get_plot_parameters(selected_folders, list(range(1, len(selected_folders) + 1)))
+    create_multi_metric_plot(selected_folders, labels, y_range)
     print("Plot visualization complete.")
 
 if __name__ == "__main__":

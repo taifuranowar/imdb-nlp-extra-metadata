@@ -1,4 +1,4 @@
-    # import sqlite3
+# import sqlite3
     # import pandas as pd
     # import matplotlib.pyplot as plt
     # import numpy as np
@@ -103,7 +103,7 @@ from scipy.stats import gaussian_kde
 import matplotlib.ticker as ticker
 
 # Connect to SQLite Database
-db_path = "/home/maira/imdb/imdb-nlp-extra-metadata/imdb_reviews.db"
+db_path = "imdb_reviews.db"
 try:
     conn = sqlite3.connect(db_path)
     query = """
@@ -134,17 +134,6 @@ if not df.empty:
         plt.ylabel('Count', fontsize=12)
         plt.grid(True, linestyle='--', alpha=0.5)
         plt.show()
-
-    ### MOVIE GENRE VISUALIZATION ###
-    plt.figure(figsize=(12, 6))
-    top_genres = df['movie_genre'].value_counts().nlargest(20)
-    sns.barplot(x=top_genres.index, y=top_genres.values, palette="magma")
-    plt.xticks(rotation=45, ha='right', fontsize=10)
-    plt.xlabel("Movie Genre", fontsize=12)
-    plt.ylabel("Count", fontsize=12)
-    plt.title("Top 20 Movie Genres in Dataset", fontsize=14, fontweight='bold')
-    plt.grid(axis='y', linestyle="--", alpha=0.5)
-    plt.show()
 
     ### DATA VISUALIZATION ###
     plt.figure(figsize=(15, 10))
@@ -185,15 +174,18 @@ if not df.empty:
     plt.ylabel('Frequency', fontsize=12)
     plt.grid(True, linestyle='--', alpha=0.5)
 
-    # Scatter Plot of User Ratings vs. Movie Average Rating
+    # Top 10 Movie Genres Barplot (replaces scatter plot)
     plt.subplot(2, 2, 4)
-    plt.scatter(df['movie_average_rating'], df['user_review_rating'], alpha=0.3, color='purple')
-    plt.title('User Rating vs Movie Average Rating', fontsize=14, fontweight='bold')
-    plt.xlabel('Movie Average Rating', fontsize=12)
-    plt.ylabel('User Review Rating', fontsize=12)
-    plt.xticks(range(int(df['movie_average_rating'].min()), int(df['movie_average_rating'].max() + 1)), fontsize=10)
-    plt.yticks(range(1, 11), fontsize=10)
-    plt.grid(True, linestyle='--', alpha=0.5)
+    # Clean up genre strings: remove brackets and quotes, keep commas
+    cleaned_genres = df['movie_genre'].astype(str).str.replace(r"[\[\]']", "", regex=True)
+    top_genres = cleaned_genres.value_counts().nlargest(10)
+    sns.barplot(x=top_genres.index, y=top_genres.values, palette="magma")
+    plt.xticks(rotation=45, ha='right', fontsize=10)
+    plt.xlabel("Movie Genre", fontsize=12)
+    plt.ylabel("Count", fontsize=12)
+    plt.title("Top 10 Movie Genres", fontsize=14, fontweight='bold')
+    plt.grid(axis='y', linestyle="--", alpha=0.5)
+    plt.subplots_adjust(bottom=0.3)  # Add extra space at bottom
 
     plt.tight_layout()
     plt.show()
